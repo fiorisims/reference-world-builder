@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+
+# Unreal: rebuilt on every machine
+ReferenceWorldBuilder/Saved/
+ReferenceWorldBuilder/Intermediate/
+ReferenceWorldBuilder/DerivedDataCache/
+ReferenceWorldBuilder/Binaries/
+ReferenceWorldBuilder/.vs/
+*.sln
+
+# What the tool makes from your pictures: rebuilt by Generate world
+ReferenceWorldBuilder/Content/ReferenceWorldBuilder/Generated/
+ReferenceWorldBuilder/Content/ReferenceWorldBuilder/Layers/
+ReferenceWorldBuilder/Content/ReferenceWorldBuilder/Library/
+ReferenceWorldBuilder/Content/Temp/
+ReferenceWorldBuilder/Content/Developers/
+ReferenceWorldBuilder/Content/Collections/
+
+# Downloaded models and search caches (re-downloaded on demand)
+ModelLibrary/*
+!ModelLibrary/README.txt
+
+# Bridge staging files and renders
+_ps_in.jsx
+_ps_out.txt
+_ps_run.jsx
+_palette_run.jsx
+_palette_strips/
+*.png
+!ReferenceWorldBuilder/Content/**/*.png
