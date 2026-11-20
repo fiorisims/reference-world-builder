@@ -26,7 +26,7 @@ from turnaround_gui import Button
 WINDOW = (1240, 840)
 CANVAS_AREA = pygame.Rect(16, 62, 900, 762)
 PANEL = pygame.Rect(930, 62, 296, 762)
-CATEGORIES = ("tree", "pine", "bush", "rock", "log", "mushroom", "house", "building", "castle", "tower",
+CATEGORIES = ("tree", "pine", "treehouse", "bush", "rock", "log", "mushroom", "house", "building", "castle", "tower",
               "wall", "fence", "bridge", "gate", "pillar", "lantern", "furniture", "vehicle", "boat",
               "character", "creature", "prop_card", "sign", "lily")
 NORMAL, CHANGED, REMOVED, SELECTED = (90, 210, 255), (255, 214, 90), (240, 80, 80), (255, 255, 255)

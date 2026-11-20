@@ -157,6 +157,16 @@
         "tree trunk"
       ]
     },
+    "treehouse": {
+      "kind": "object",
+      "words": [
+        "treehouse",
+        "tree house",
+        "tree home",
+        "tree hut",
+        "tree cottage"
+      ]
+    },
     "castle": {
       "kind": "object",
       "words": [

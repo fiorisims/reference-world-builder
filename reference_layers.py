@@ -67,6 +67,8 @@ DEFAULT_KEYWORDS = {
             "cliff", "crag", "ledge", "bluff", "outcrop", "rockface", "plateau", "mesa"]},
         "log": {"kind": "object", "words": [
             "log", "stump", "trunk", "branch", "driftwood", "timber", "fallen tree", "tree trunk"]},
+        "treehouse": {"kind": "object", "words": [
+            "treehouse", "tree house", "tree home", "tree hut", "tree cottage"]},
         "castle": {"kind": "object", "words": [
             "castle", "palace", "fortress", "fort", "keep", "citadel", "stronghold", "chateau", "kingdom"]},
         "tower": {"kind": "object", "words": ["gazebo", "pavilion", "rotunda", 

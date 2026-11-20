@@ -58,7 +58,29 @@ world lines up with the picture.
    **Prop density**), only go **outside the painted view**, so they fill the map without disturbing
    the picture. Turn them off with
    **Add extra copies of repeated things outside the painted view**. Characters and creatures
-   are never duplicated.
+   are never duplicated. About half of the extra trees are **new trees drawn in your painting's
+   style** (see below); the rest come from the model library, so the forest still varies.
+
+### Trees, canopies and treehouses
+
+Painted forests rarely separate one tree from the next, so trees are read by **structure and colour**
+as well as by name (`reference_trees.py`). Leaves (green to teal) and bark (red to brown) are told apart by
+colour; sky, mist and stone are neither.
+
+- **Every tree gets its canopy.** The detector usually outlines only a trunk, because the leaves melt
+  into every other tree's. The leaves joined to the top of each trunk (above the horizon: leaves below
+  it are grass) become that tree's canopy. When trees share one mass of leaves, the nearest tree gets
+  each part of it, and a confidently seen tree reaches further than a doubtful one.
+- **Treehouses.** A "castle" or "house" with leaves over it and a trunk running up through it is a
+  treehouse: its house is built round the trunk and the canopy spreads over it. A doubtful "castle"
+  that is really one bark column (a trunk in the mist) becomes a tree and keeps only its trunk.
+- **Trees are built as trees:** a round trunk and a canopy of leaf clumps that is as deep as it is
+  wide, so it looks right from the side and not like a painted card.
+- **Look-alike trees.** The trunks across the whole picture give the tree style: how thick they are,
+  where they fork, how far the branches spread, where the leaves start, how wide the canopy is, and
+  the bark and leaf colours. Four new trees are drawn and painted in that style, then modelled like the
+  painted ones. They are only used for extra copies outside the painted view. The report says what was
+  read, e.g. *Tree style: 15 trunks read, fork at 57%, 2 branches, leaves from 38% of the height up*.
 
 ### Cities, rooms, deserts, snow and coasts
 
@@ -124,7 +146,8 @@ then press **Analyze reference** again.
 
 | Shape | Used for | How |
 | --- | --- | --- |
-| Inflate | trees, bushes, rocks, flowers, anything unknown | outline puffed out by distance to its edge, so trunks are fat and branches thin |
+| Tree | trees and treehouses with a canopy | trunk puffed out (a treehouse's house built round it), canopy filled with leaf clumps front to back |
+| Inflate | trees without a visible canopy, bushes, rocks, flowers, anything unknown | outline puffed out by distance to its edge, so trunks are fat and branches thin |
 | Lathe | towers, mushrooms, lanterns, pillars, pines, furniture | each row of the outline becomes a ring |
 | Slab | walls, gates, signs, people, houses, castles, buildings, vehicles | outline extruded with a soft bevel; houses and castles are deep, signs are thin |
 | Ground | boats, lily pads, bridges | outline projected through the camera onto the ground, then domed |

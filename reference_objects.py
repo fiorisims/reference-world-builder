@@ -39,7 +39,7 @@ CLIP_REPO = "Xenova/clip-vit-base-patch32"
 CLIP_VISION = "onnx/vision_model_quantized.onnx"
 CLIP_TEXT = "onnx/text_model_quantized.onnx"
 CLIP_TOKENIZER = "tokenizer.json"
-RECOGNIZER_VERSION = "rwb-objects-13"
+RECOGNIZER_VERSION = "rwb-objects-14"
 OWL_SIZE = 960
 SAM_SIZE = 1024
 SCORE_MIN = 0.10          # below this OWLv2 is guessing, even on paintings
@@ -67,6 +67,7 @@ QUERIES = {
     "a rock": "rock", "a boulder": "rock", "a cliff": "cliff", "a log": "log", "a tree stump": "log",
     "a mushroom": "mushroom", "a boat": "boat", "a canoe": "boat", "a lily pad": "lily",
     "a castle": "castle", "a tower": "tower", "a gazebo": "tower", "a greenhouse": "house",
+    "a treehouse": "treehouse", "a house built into a tree": "treehouse",
     "a house": "house", "a cottage": "house", "a stone wall": "wall", "a fence": "fence",
     "a bridge": "bridge", "an archway": "gate", "a stone column": "pillar", "a lamp post": "lantern",
     "a lantern": "lantern", "a bench": "furniture", "a barrel": "furniture", "a bucket": "furniture",
@@ -701,8 +702,8 @@ def is_scenery(place, category, horizon_frac):
     # the ground itself: runs off the bottom of the frame and is wider than it is tall
     if y1 > 1 - edge and wide > 0.3 and (y1 - y0) < wide and category not in GROUNDED_CATEGORIES:
         return True
-    # a big dark mass running off two sides, unless it is a tree framing the shot
-    if touches >= 2 and category not in ("tree", "pine"):
+    # a big dark mass running off two sides, unless it is a tree framing the shot (or its canopy does)
+    if touches >= 2 and category not in ("tree", "pine", "treehouse"):
         return True
     if horizon_frac is not None and place["contact_v"] < horizon_frac - HORIZON_SLACK:
         # its lowest point is in the sky: canopy and backdrop, unless it is small and may hang or fly
@@ -863,6 +864,15 @@ def recognize(rgb, texture, cache_dir, stamp, keywords_path=None, disp=None, fit
                 if phrase:
                     d["label"], d["category"] = short_label(phrase), table[phrase]
             d["label"], d["category"] = sensible_label(d["label"], d["category"], d["place"])
+        # structure over names: a "castle" with a trunk up through it and leaves over it is a treehouse,
+        # and every tree gets the canopy that melted into the forest's (reference_trees)
+        try:
+            import reference_trees
+            changes = reference_trees.refine(rgb, candidates, horizon, describe_mask)
+            if changes:
+                info += " + tree check (%s)" % ", ".join(changes[:4])
+        except Exception as error:
+            info += " (tree check failed: %s)" % str(error)[:80]
         horizon_frac = None if horizon is None else horizon / float(H)
         # the detector saw the whole scene: a relabel from the close-up can't make something scenery
         candidates = [d for d in candidates if not (is_scenery(d["place"], d["category"], horizon_frac)
@@ -871,13 +881,19 @@ def recognize(rgb, texture, cache_dir, stamp, keywords_path=None, disp=None, fit
             mask = d["mask"]
             place = d["place"]
             box_area = max(1.0, (d["box"][2] - d["box"][0]) * (d["box"][3] - d["box"][1]))
-            cut = save_cutout(texture, mask, place["bbox"], cache_dir / ("cut_%02d.png" % len(objects)), (H, W))
+            number = len(objects)
+            cut = save_cutout(texture, mask, place["bbox"], cache_dir / ("cut_%02d.png" % number), (H, W))
+            leaves = None
+            if d.get("canopy_mask") is not None and d["canopy_mask"].any():
+                leaves = save_cutout(texture, d["canopy_mask"], place["bbox"], cache_dir / ("cut_%02d_leaves.png" % number),
+                                     (H, W))
             objects.append({
                 "centre_u": (place["bbox"][0] + place["bbox"][2]) / 2.0 / W,
                 "label": d["label"], "category": d["category"], "score": round(d["score"], 3),
                 "quality": d["quality"], "coverage": round(float(mask.sum() / box_area), 3),
                 "roughness": round(roughness(mask), 2), "parts": d.get("parts", []),
-                "box": [round(v, 1) for v in d["box"]], "cutout": cut,
+                "box": [round(v, 1) for v in d["box"]], "cutout": cut, "leaves": leaves,
+                "canopy_share": d.get("canopy_share"), "was": d.get("was"), "tree_facts": d.get("tree_facts"),
                 "depth_eye": relative_depth(disp, mask, fit, horizon, focal), **place,
             })
     cache.write_text(json.dumps({"key": key, "objects": objects, "areas": areas, "info": info}), encoding="utf-8")

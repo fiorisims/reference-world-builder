@@ -37,7 +37,7 @@ PRIORS = {
     "wall": ("h", 300), "fence": ("h", 110), "bridge": ("w", 700), "gate": ("h", 420), "pillar": ("h", 380),
     "lantern": ("h", 260), "furniture": ("h", 110), "character": ("h", 175), "creature": ("h", 110),
     "prop_card": ("h", 160), "unknown": ("h", 200),
-    "building": ("h", 1500), "sign": ("h", 150), "vehicle": ("h", 150),
+    "building": ("h", 1500), "sign": ("h", 150), "vehicle": ("h", 150), "treehouse": ("h", 1400),
 }
 BASE_COUNTS = {
     "tree": 16, "pine": 16, "bush": 12, "thorns": 10, "flower": 24, "grass": 30, "rock": 9, "cliff": 4,
@@ -57,6 +57,8 @@ GRASS_CAP = 240               # grass models on a grassy map (they're individual
 TOTAL_CAP = 650
 MAX_GENERATED = 60            # models built per picture (largest first)
 MAX_COUNT = 200               # copies of one model the panel may ask for
+LOOKALIKE_SHARE = 0.5         # of the extra trees around the view: new trees drawn in the painting's style
+                              # (reference_trees); the rest come from the model library, for variety
 _world = {}                   # the last world built this session: lets the panel change it in place
 # what each kind of place does to the world (copied from reference_setting.SETTINGS, which can't be
 # imported here: it needs numpy).  terrain = hilliness, grass = grow it, forest = extra trees around,
@@ -564,8 +566,12 @@ def _plan(inv, camera):
     return plan
 
 
-def _job_objects(plan, camera, detail=1.0):
-    """What the mesh builder needs, largest objects first, within the model budget."""
+def _job_objects(plan, camera, detail=1.0, lookalikes=()):
+    """What the mesh builder needs, largest objects first, within the model budget.
+
+    lookalikes: new trees in the painting's style (inventory "trees"), built like painted ones but only
+    ever scattered around the view.
+    """
     jobs = []
     for number, record in enumerate(plan):
         inst = record["inst"]
@@ -576,10 +582,16 @@ def _job_objects(plan, camera, detail=1.0):
             "id": record["model_id"], "cutout": inst["cutout"], "category": record["category"],
             "label": inst.get("label") or record["category"], "bbox": inst.get("bbox_px"),
             "area": inst.get("area", 0.05), "quality": inst.get("quality"), "roughness": inst.get("roughness"),
-            "detail": detail,
+            "detail": detail, "leaves": inst.get("leaves"),
         })
         if len(jobs) >= MAX_GENERATED:
             break
+    for extra in lookalikes:
+        if extra.get("cutout") and Path(extra["cutout"]).is_file():
+            jobs.append({"id": extra["id"], "name": extra["id"], "cutout": extra["cutout"], "leaves": extra.get("leaves"),
+                         "category": extra.get("category", "tree"), "label": extra.get("label", "tree"),
+                         "area": extra.get("area", 0.05), "quality": 1.0, "roughness": 0.0, "detail": detail,
+                         "lookalike": extra.get("lookalike", "tree")})
     return jobs
 
 
@@ -715,8 +727,8 @@ def _spawn_copy(world, record, number):
 # fixing one model: a different shape type, or a redrawn outline
 # --------------------------------------------------------------------------- #
 SHAPE_NAMES = {None: "Auto", "inflate": "Puffy", "lathe": "Round", "slab": "Flat front", "ground": "Lying down",
-               "cluster": "Leafy mass", "composite": "Building", "adopt": "Found model"}
-SHAPE_ORDER = [None, "inflate", "lathe", "slab", "cluster", "composite", "ground"]
+               "cluster": "Leafy mass", "composite": "Building", "tree": "Tree", "adopt": "Found model"}
+SHAPE_ORDER = [None, "inflate", "lathe", "slab", "cluster", "tree", "composite", "ground"]
 
 
 def _shapes_path(cache_dir):
@@ -738,6 +750,7 @@ def _fix_model(args, record, method):
     name = "%s_%s" % (key, method)
     models, lines = rwb_generated.build_models(
         [{"id": name, "name": name, "cutout": inst["cutout"], "category": record["category"], "method": method,
+          "leaves": inst.get("leaves"),
           "label": inst.get("label") or record["category"], "bbox": inst.get("bbox_px") or inst.get("bbox"),
           "area": inst.get("area", 0.05), "detail": args.get("detail", 1.0)}],
         args["camera_data"], args["name"], str(Path(args["cache_dir"]).resolve() / "fixes"), wb._run_helper, args["script"],
@@ -1092,8 +1105,20 @@ def _spawn_fallback(ctx, record, models, label, cache_dir, rng):
     return "%s: nothing to build it from - add a model named '%s' to ModelLibrary" % (title, obj.get("word") or category)
 
 
-def _scatter_extras(ctx, obj, models, generated, camera, density, area, rng, total):
-    """Extra copies of a repeated thing, outside the painted view.  Returns how many were made."""
+def scatter_source(rng, has_library, has_lookalikes, share):
+    """Where one extra copy comes from: "lookalike" (drawn in the painting's style), "library" or "painted"."""
+    if has_lookalikes and (not has_library or rng.random() < share):
+        return "lookalike"
+    return "library" if has_library else "painted"
+
+
+def _scatter_extras(ctx, obj, models, generated, camera, density, area, rng, total, lookalikes=(), share=LOOKALIKE_SHARE):
+    """Extra copies of a repeated thing, outside the painted view.  Returns how many were made.
+
+    models: library models; generated: the painted ones' own models; lookalikes: new models drawn in
+    the painting's style.  Library and look-alike copies are mixed (``share`` of them look-alikes), so the
+    forest looks like the painting and still has some variety.
+    """
     placer = ctx["placer"]
     category = obj["category"]
     in_water = category in WATER_OBJECTS
@@ -1108,7 +1133,8 @@ def _scatter_extras(ctx, obj, models, generated, camera, density, area, rng, tot
         if not rwb_layout.scatter_allowed(camera, x, y):
             continue
         label = "RWB_%s_extra_%03d" % (rwb_layers._safe(category, 16), made)
-        if models:
+        source = scatter_source(rng, bool(models), bool(lookalikes), share)
+        if source == "library":
             model = rng.choice(models)
             scale, target = _scale_for(model, category, ctx["size"], rng.uniform(0.8, 1.2))
             r = model["width"] * scale * 0.5 * (0.75 if category in ("tree", "pine") else 1.0)
@@ -1116,7 +1142,10 @@ def _scatter_extras(ctx, obj, models, generated, camera, density, area, rng, tot
                 continue
             _spawn_model(ctx, model, x, y, scale, palettes[made % len(palettes)], label, rng.uniform(0, 360), in_water)
         else:
-            model = rng.choice(generated)
+            pool = list(lookalikes) if source == "lookalike" else list(generated)
+            if not pool:
+                break
+            model = rng.choice(pool)
             if model["method"] == "ground":
                 return made
             _axis, value = PRIORS.get(category, ("h", 200))
@@ -1308,7 +1337,10 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
                   "detail": detail,
                   "strokes": strokes, "strength": strength, "script": Path(root_dir) / "reference_mesh.py"}
     if values.get("generate_models", True):
-        jobs = _job_objects([r for r in plan if not r.get("drawn")], camera, detail)
+        lookalike_jobs = []
+        if not setting["box"] and values.get("lookalike_trees", True):
+            lookalike_jobs = (inv.get("trees") or {}).get("lookalikes") or []
+        jobs = _job_objects([r for r in plan if not r.get("drawn")], camera, detail, lookalike_jobs)
         if jobs:
             try:
                 generated, lines = rwb_generated.build_models(
@@ -1521,7 +1553,18 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
         model = generated.get(record.get("model_id"))
         if model:
             by_category.setdefault(record["category"], []).append(model)
-    for obj in inv.get("objects") or []:
+    lookalikes = {}
+    for model in generated.values():
+        if model.get("lookalike"):
+            lookalikes.setdefault(model["lookalike"], []).append(model)
+    share = float(values.get("lookalike_share", LOOKALIKE_SHARE))
+    scatter_objects = list(inv.get("objects") or [])
+    if setting["forest"] and lookalikes.get("tree") and not any(o["category"] == "tree" for o in scatter_objects):
+        # the trees were only trunks in the paint (or inside a treehouse): the forest still needs some
+        scatter_objects.append({"category": "tree", "count": 0, "unique": False, "instances": []})
+    if lookalikes.get("tree") and (inv.get("trees") or {}).get("line"):
+        report.append(inv["trees"]["line"])
+    for obj in scatter_objects:
         category = obj["category"]
         models = list(library.get(category, []))
         for other in FALLBACK.get(category, []):
@@ -1538,12 +1581,14 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
         if not values.get("extra_copies", True) or setting["box"] or                 (obj["unique"] and not (category in FOREST and setting["forest"])):
             continue
         extras = by_category.get(category) or []
-        if not models and not extras:
+        alike = lookalikes.get(category) or []
+        if not models and not extras and not alike:
             continue
-        made = _scatter_extras(ctx, obj, models, extras, camera, density, area, rng, total)
+        made = _scatter_extras(ctx, obj, models, extras, camera, density, area, rng, total, alike, share)
         total += made
         if made:
-            report.append("%s: seen %d times, %d extra copies outside the painted view" % (category, obj["count"], made))
+            report.append("%s: %d extra copies outside the painted view%s" % (
+                category, made, " (seen %d times)" % obj["count"] if obj["count"] else ""))
 
     try:
         import rwb_scene

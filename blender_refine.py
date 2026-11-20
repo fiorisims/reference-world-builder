@@ -17,8 +17,9 @@ import bmesh
 import bpy
 import numpy as np
 
-VOXELS_PER_LONG_SIDE = {"lathe": 150, "slab": 200, "inflate": 170, "ground": 170, "composite": 220, "cluster": 130}
-SMOOTH_STEPS = {"lathe": 3, "slab": 2, "inflate": 8, "ground": 6, "composite": 3, "cluster": 12}
+VOXELS_PER_LONG_SIDE = {"lathe": 150, "slab": 200, "inflate": 170, "ground": 170, "composite": 220, "cluster": 130,
+                        "tree": 180}
+SMOOTH_STEPS = {"lathe": 3, "slab": 2, "inflate": 8, "ground": 6, "composite": 3, "cluster": 12, "tree": 6}
 MAX_TRIS = 14000
 MIN_TRIS = 300
 # the Model style slider (0 = generic low poly, 1 = as painted)

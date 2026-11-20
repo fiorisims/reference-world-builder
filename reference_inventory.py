@@ -35,7 +35,7 @@ import reference_layers as rl  # noqa: E402
 import reference_objects  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
-INVENTORY_VERSION = "rwb-inventory-6"
+INVENTORY_VERSION = "rwb-inventory-7"
 WATER_GRID = 72           # terrain follows the shore much better than the old 24 x 24 grid
 MAX_LAYER_LOOKS = 24      # PSD layers recognised from pixels per analysis (about 3 s each)
 GENERIC_MIN_SCORE = 0.15  # a "Layer 3" must look like something, or it is paint rather than an object
@@ -561,6 +561,49 @@ def _depth_and_buildings(objects, rgb, horizon, disp, floor, full_picture, cache
     return info
 
 
+TREE_KINDS = {"tree", "treehouse"}
+
+
+def tree_lookalikes(objects, rgb, horizon, cache_dir, setting_info):
+    """The picture's tree style and new trees drawn in it (reference_trees), for the forest around.
+
+    Only for places that have trees: painted ones, or (outdoors) enough trunk-shaped paint.
+    """
+    import reference_trees
+    H, W = rgb.shape[:2]
+    trees, canopies = [], []
+    others = np.zeros((H, W), bool)
+    for entry in objects.values():
+        for inst in entry["instances"]:
+            box = inst.get("bbox_px")
+            if not box or not inst.get("cutout"):
+                continue
+            x0, y0, x1, y1 = [int(round(v)) for v in box]
+            x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            outline = _cutout_alpha(inst["cutout"], x1 - x0, y1 - y0)
+            if outline is None:
+                continue
+            full = np.zeros((H, W), bool)
+            full[y0:y1, x0:x1] = outline
+            if entry["category"] in TREE_KINDS:
+                trees.append(full)
+                leaves = _cutout_alpha(inst.get("leaves"), x1 - x0, y1 - y0)
+                canopy = None
+                if leaves is not None:
+                    canopy = np.zeros((H, W), bool)
+                    canopy[y0:y1, x0:x1] = leaves
+                canopies.append(canopy)
+            else:
+                others |= full
+    style, bark_px, leaf_px = reference_trees.read_style(rgb, trees, canopies, others, horizon)
+    if not trees and not (setting_info.get("forest") and style.get("trunks", 0) >= 3):
+        return {"style": style, "line": "", "lookalikes": []}
+    made = reference_trees.lookalikes(style, bark_px, leaf_px, Path(cache_dir).resolve() / "lookalikes")
+    return {"style": style, "line": reference_trees.line(style), "lookalikes": made}
+
+
 def build(result, image_path, cache_dir, keywords_path, setting=None):
     """The inventory of a picture.  setting: a reference_setting name, or None/"auto" to read it."""
     cache_dir = Path(cache_dir)
@@ -821,6 +864,13 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
                                               chosen, setting_info)
         except Exception as error:
             missing.append("depth order (%s)" % str(error)[:80])
+    trees = {"style": None, "line": "", "lookalikes": []}
+    if not setting_info.get("box"):                    # streets and rooms have no forest around them
+        rwb_progress.report(0.89, "Reading the trees' style")
+        try:
+            trees = tree_lookalikes(objects, rgb, horizon, cache_dir, setting_info)
+        except Exception as error:
+            missing.append("tree style (%s)" % str(error)[:80])
     water = _merge_grids(water_grids)
     tile_path = None
     if water:
@@ -856,6 +906,7 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
         "picture_full": full_picture,
         "depth": depth_info,
         "plate": depth_info.get("plate"),
+        "trees": trees,
     }
 
 
@@ -875,4 +926,7 @@ def summary(inventory):
         lines.append("  water: pond / river basin")
     if inventory.get("hills", {}).get("coverage"):
         lines.append("  hills / mountains")
+    trees = inventory.get("trees") or {}
+    if trees.get("lookalikes"):
+        lines.append("  %s; %d new trees drawn in it" % (trees.get("line"), len(trees["lookalikes"])))
     return lines

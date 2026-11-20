@@ -938,6 +938,179 @@ def test_trees_and_style():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _forest_picture(h=300, w=400):
+    """Sky, a teal canopy, brown Y-shaped trunks, a grey house round one trunk, grass below the horizon."""
+    rgb = np.zeros((h, w, 3), np.uint8)
+    rgb[:] = (170, 185, 230)                                     # sky
+    rgb[int(h * 0.6):] = (70, 120, 60)                           # grass (leaf-coloured, but below the horizon)
+    ys, xs = np.mgrid[0:h, 0:w]
+    canopy = ((xs - 200) / 190.0) ** 2 + ((ys - 60) / 70.0) ** 2 <= 1.0
+    rgb[canopy] = (60, 95, 90)
+    trunks = np.zeros((h, w), bool)
+    for cx in (60, 200, 330):
+        trunks |= (abs(xs - cx) <= 6) & (ys >= 110) & (ys < 180)          # trunk
+        for side in (-1, 1):                                              # Y fork
+            t = (180 - ys) / 70.0
+            arm = (ys >= 70) & (ys < 112) & (abs(xs - (cx + side * (112 - ys) * 0.6)) <= 4)
+            trunks |= arm & (t > 0)
+    rgb[trunks] = (120, 75, 55)
+    house = (abs(xs - 200) <= 26) & (ys >= 105) & (ys < 178) & ~((abs(xs - 200) <= 6))
+    rgb[house] = (190, 185, 200)                                 # a pale glasshouse round the middle trunk
+    return rgb, trunks, house, canopy
+
+
+def test_tree_reading():
+    import ast
+    import reference_trees as rt
+    rgb, trunks, house, canopy = _forest_picture()
+    H, W = rgb.shape[:2]
+    leaves, bark = rt.colour_classes(rgb)
+    check("trees: the canopy is leaves", leaves[canopy & ~trunks].mean() > 0.95, leaves[canopy & ~trunks].mean())
+    check("trees: trunks are bark", bark[trunks].mean() > 0.95, bark[trunks].mean())
+    check("trees: sky and a pale house are neither", not leaves[:5, :5].any() and not bark[house].any())
+    # the house round the middle trunk, as the detector would outline it
+    ys, xs = np.mgrid[0:H, 0:W]
+    outline = (abs(xs - 200) <= 26) & (ys >= 100) & (ys < 178)
+    facts = rt.read_object(leaves, bark, outline, H)
+    check("trees: a canopy over the house is seen", facts["canopy"] >= rt.CANOPY_MIN, facts)
+    check("trees: the trunk up through it is seen", facts["trunk"] >= rt.TRUNK_COLUMN, facts)
+    check("trees: a confident castle with a tree through it is a treehouse", rt.compound_label("castle", 0.5, facts) == "treehouse")
+    check("trees: a castle in the open stays a castle",
+          rt.compound_label("castle", 0.5, {"canopy": 0.0, "trunk": 0.9, "bark": 0.2}) is None)
+    check("trees: a red brick house isn't a trunk",
+          rt.compound_label("house", 0.5, {"canopy": 0.9, "trunk": 1.0, "bark": 0.9}) is None)
+    check("trees: a doubtful castle that is one bark column is a tree",
+          rt.compound_label("castle", 0.12, {"canopy": 0.1, "trunk": 0.95, "bark": 0.5}) == "tree")
+    check("trees: a 'treehouse' that is all bark is a tree",
+          rt.compound_label("treehouse", 0.4, {"canopy": 0.3, "trunk": 1.0, "bark": 0.6}) == "tree")
+    check("trees: a 'treehouse' with no trunk is a house",
+          rt.compound_label("treehouse", 0.2, {"canopy": 0.8, "trunk": 0.0, "bark": 0.0}) == "house")
+    # refine: relabel + canopies, two trees share the foliage between them
+    left_trunk = trunks & (xs < 120)
+    items = [{"mask": outline.copy(), "category": "castle", "label": "castle", "score": 0.5},
+             {"mask": left_trunk.copy(), "category": "tree", "label": "tree", "score": 0.3}]
+    changes = rt.refine(rgb, items, horizon=0.6 * H, describe=ro.describe_mask)
+    house_item, tree_item = items
+    check("trees: refine reports the relabel", changes == ["castle -> treehouse"], changes)
+    check("trees: the treehouse gets the canopy above it", house_item["canopy_mask"] is not None
+          and house_item["canopy_mask"][40, 200] and house_item["mask"][40, 200])
+    check("trees: its placement grows with it", house_item["place"]["top_v"] < 0.1, house_item["place"]["top_v"])
+    check("trees: the left tree gets the leaves over it", tree_item["canopy_mask"] is not None and tree_item["canopy_mask"][60, 40])
+    check("trees: foliage is never claimed twice", not (house_item["canopy_mask"] & tree_item["canopy_mask"]).any())
+    check("trees: grass below the horizon is not canopy", not house_item["mask"][int(0.6 * H) + 2:].any() or
+          not (house_item["mask"] & ~outline)[int(0.6 * H):].any())
+    check("trees: dark leaves inside a canopy are still canopy",
+          rt.fill_enclosed(np.pad(np.ones((5, 5), bool), 2) & ~np.pad(np.pad(np.ones((1, 1), bool), 2), 2))[4, 4])
+    # trunk shape and the picture's style
+    y_tree = np.zeros((120, 60), bool)
+    y_tree[60:120, 26:34] = True
+    for r in range(10, 60):
+        off = int((60 - r) * 0.4)
+        y_tree[r, 26 - off:30 - off] = True
+        y_tree[r, 30 + off:34 + off] = True
+    shape = rt.trunk_shape(y_tree)
+    check("trees: a Y forks about half-way", shape and shape["fork"] and 0.4 < shape["fork"] < 0.6, shape)
+    check("trees: ... into two branches", shape and shape["branches"] == 2, shape)
+    check("trees: a fallen branch is not a trunk", rt.trunk_shape(np.eye(60, dtype=bool) | np.eye(60, k=1, dtype=bool)) is None)
+    style, bark_px, leaf_px = rt.read_style(rgb, [house_item["mask"]], [house_item["canopy_mask"]], None, 0.6 * H)
+    check("trees: the style reads the painted trunks", style["trunks"] >= 2 and style["fork"], style)
+    check("trees: the style takes the painted colours", style["bark"][1] != rt.DEFAULT_STYLE["bark"][1]
+          and style["leaves"][1] != rt.DEFAULT_STYLE["leaves"][1], (style["bark"], style["leaves"]))
+    check("trees: the report line says it", "fork" in rt.line(style))
+    # new trees in that style
+    pygame.display.init()
+    tmp = Path(tempfile.mkdtemp(prefix="rwb_trees_"))
+    try:
+        made = rt.lookalikes(style, bark_px, leaf_px, tmp, count=2)
+        check("trees: look-alikes are written", len(made) == 2 and all(Path(m["cutout"]).is_file() and Path(m["leaves"]).is_file()
+                                                                      for m in made))
+        a = rm.load_rgba(made[0]["cutout"])
+        b = rm.load_rgba(made[1]["cutout"])
+        check("trees: every look-alike is a new design", a.shape != b.shape or not np.array_equal(a, b))
+        check("trees: the same seed draws the same tree", np.array_equal(rt.paint_tree(style, bark_px, leaf_px, 5),
+                                                                         rt.paint_tree(style, bark_px, leaf_px, 5)))
+        on = a[..., 3] > 0
+        drawn_leaves, drawn_bark = rt.colour_classes(a[..., :3])
+        check("trees: look-alike leaves are painted in leaf colours", drawn_leaves[on].mean() > 0.5, drawn_leaves[on].mean())
+        check("trees: ... with a trunk in bark colours", drawn_bark[on].mean() > 0.02, drawn_bark[on].mean())
+        check("trees: the trunk stands at the bottom", on[-3].any() and on[-3].sum() < on[:-3].sum(1).max())
+        # the tree builder: trunk + volumetric canopy
+        cam = {"W": 768.0, "H": 548.0, "horizon": 335.0, "focal": 665.1}
+        entry = rm.build_object({**made[0], "name": "la", "bbox": [0, 0, 10, 300]}, tmp, cam, 0)
+        check("trees: a look-alike is built as a tree", entry["method"] == "tree", entry["method"])
+        check("trees: its canopy is round, not a flat card", entry["size"][1] > 0.5 * entry["size"][0], entry["size"])
+        check("trees: its art wraps round it", entry["wrap_art"])
+        check("trees: look-alikes are marked for the scatter", entry["lookalike"] == "tree")
+        grid = np.zeros((40, 30), bool)
+        grid[5:15, 5:25] = True                     # canopy
+        grid[15:40, 13:17] = True                   # trunk
+        grid[2:4, 0:2] = True                       # a stray leaf speck far away
+        leafy = grid.copy()
+        leafy[15:, :] = False
+        verts, faces = rm.tree_mesh(grid, leafy)
+        check("trees: no leaves float free of the tree", verts[:, 0].min() > 2.0, verts[:, 0].min())
+        verts, faces = rm.canopy_balls(np.pad(np.ones((20, 30), bool), 2), seed=3)
+        check("trees: a canopy has real depth", np.ptp(verts[:, 1]) > 0.5 * np.ptp(verts[:, 0]), (np.ptp(verts[:, 1]), np.ptp(verts[:, 0])))
+        again, _ = rm.canopy_balls(np.pad(np.ones((20, 30), bool), 2), seed=3)
+        check("trees: a canopy rebuilds the same", np.array_equal(verts, again))
+        # a painted tree with the recogniser's own canopy mask, and a treehouse
+        cut = np.zeros((120, 80, 4), np.uint8)
+        cut[40:120, 35:45] = (120, 75, 55, 255)
+        cut[0:50, 5:75] = (60, 95, 90, 255)
+        cut[60:110, 20:60] = (190, 185, 200, 255)
+        cut[60:110, 36:44] = (120, 75, 55, 255)
+        leaves_png = np.zeros_like(cut)
+        leaves_png[0:50, 5:75, 3] = 255
+        for name, arr in (("th.png", cut), ("th_leaves.png", leaves_png)):
+            pygame.image.save(pygame.image.frombuffer(arr.tobytes(), (80, 120), "RGBA"), str(tmp / name))
+        house_entry = rm.build_object({"id": "th", "name": "th", "cutout": str(tmp / "th.png"), "leaves": str(tmp / "th_leaves.png"),
+                                       "category": "treehouse", "label": "treehouse", "bbox": [0, 0, 80, 120]}, tmp, cam, 1)
+        check("trees: a treehouse is a tree with its house", house_entry["method"] == "tree", house_entry["method"])
+        bare = rm.build_object({"id": "b", "name": "b", "cutout": str(tmp / "th.png"), "category": "treehouse",
+                                "label": "treehouse", "bbox": [0, 0, 80, 120], "method": "composite"}, tmp, cam, 2)
+        check("trees: the panel's shape choice still wins", bare["method"] == "composite")
+        one = rm.build_all([{"id": "x", "name": "x", "cutout": str(tmp / "th.png"), "category": "treehouse", "detail": 1.0}],
+                           tmp / "k1", cam, use_blender=False)
+        two = rm.build_all([{"id": "x", "name": "x", "cutout": str(tmp / "th.png"), "category": "treehouse", "detail": 1.0,
+                             "leaves": str(tmp / "th_leaves.png")}], tmp / "k2", cam, use_blender=False)
+        check("trees: a new canopy mask rebuilds the model", one["key"] != two["key"])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    # recognition and the world know about all this
+    check("trees: a treehouse running off the frame isn't scenery",
+          not ro.is_scenery({"bbox_frac": [0.0, 0.0, 0.6, 0.8], "contact_v": 0.8, "area": 0.3}, "treehouse", 0.6))
+    check("trees: the detector can name a treehouse", "treehouse" in ro.QUERIES.values())
+    source = (HERE / "ReferenceWorldBuilder" / "Content" / "Python" / "rwb_world.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("scatter_source", "_job_objects")]
+    nodes += [n for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") in ("MAX_GENERATED", "PRIORS",
+                                                                                                         "SHAPE_ORDER", "LOOKALIKE_SHARE")]
+    scope = {"Path": Path}
+    exec(compile(ast.Module(nodes, []), "rwb_world", "exec"), scope)
+    import random
+    rng = random.Random(4)
+    picks = [scope["scatter_source"](rng, True, True, 0.5) for _ in range(400)]
+    check("world: the forest mixes look-alikes and library trees", 150 < picks.count("lookalike") < 250, picks.count("lookalike"))
+    check("world: library trees only, without look-alikes",
+          {scope["scatter_source"](rng, True, False, 0.5) for _ in range(50)} == {"library"})
+    check("world: look-alikes fill in for an empty library",
+          {scope["scatter_source"](rng, False, True, 0.5) for _ in range(50)} == {"lookalike"})
+    check("world: without either, copies of the painted ones", scope["scatter_source"](rng, False, False, 0.5) == "painted")
+    plan = [{"inst": {"cutout": __file__, "leaves": "l.png", "label": "tree"}, "category": "tree"}]
+    jobs = scope["_job_objects"](plan, None, 1.0, [{"id": "la_tree_00", "cutout": __file__, "leaves": "x.png",
+                                                   "lookalike": "tree"}, {"id": "gone", "cutout": "missing.png"}])
+    check("world: painted trees take their canopy mask along", jobs[0]["leaves"] == "l.png")
+    check("world: look-alikes are built with the painted models", [j["id"] for j in jobs] == ["m000", "la_tree_00"]
+          and jobs[1]["lookalike"] == "tree", [j["id"] for j in jobs])
+    check("world: a treehouse has a real-world size", "treehouse" in scope["PRIORS"])
+    check("world: the panel offers the tree shape", "tree" in scope["SHAPE_ORDER"])
+    check("world: the scatter uses the look-alikes", "lookalikes.get(category)" in source and "scatter_source(" in source)
+    generated = (HERE / "ReferenceWorldBuilder" / "Content" / "Python" / "rwb_generated.py").read_text(encoding="utf-8")
+    check("world: imported models remember they are look-alikes", '"lookalike": entry.get("lookalike")' in generated)
+    inventory = (HERE / "reference_inventory.py").read_text(encoding="utf-8")
+    check("world: the inventory draws the look-alikes", "tree_lookalikes(" in inventory and '"trees": trees' in inventory)
+
+
 def test_surfaces():
     import reference_surfaces as rf
     check("green reads as grass", max(rf.NATURE_SURFACES, key=rf.colour_prior((70, 150, 60)).get) == "grass")
@@ -1597,7 +1770,7 @@ def main():
     args = parser.parse_args()
     for test in (test_camera, test_placement, test_ground_placement, test_filtering, test_masks, test_labels,
                  test_psd_names, test_mesh, test_ground_shape, test_end_to_end_no_blender,
-                 test_clicks_are_queued, test_catalog, test_settings, test_buildings_and_signs, test_water_check, test_floor_finding, test_trees_and_style, test_surfaces, test_wading, test_progress_and_speed, test_shape_choice, test_outlines, test_water,
+                 test_clicks_are_queued, test_catalog, test_settings, test_buildings_and_signs, test_water_check, test_floor_finding, test_trees_and_style, test_tree_reading, test_surfaces, test_wading, test_progress_and_speed, test_shape_choice, test_outlines, test_water,
                  test_read_strokes, test_quilt, test_bake, test_sketch, test_depth_and_buildings):
         test()
     if args.live:

@@ -55,7 +55,7 @@ GRID_LONG = 112          # silhouette resolution (long side, in cells)
 GRID_LOW = 18            # ... with Model style at Low poly
 TEXTURE_LONG = 1024      # art texture resolution (long side)
 RING_SIDES = 28          # sides of a lathe ring
-MESH_VERSION = "rwb-mesh-9"
+MESH_VERSION = "rwb-mesh-10"
 HERE = Path(__file__).resolve().parent
 
 LATHE = {"tower", "mushroom", "lantern", "pillar", "pine", "furniture"}
@@ -63,6 +63,9 @@ SLAB = {"wall", "fence", "gate", "prop_card", "character", "creature", "floating
         "building", "sign", "vehicle"}
 GROUND = {"boat", "lily", "bridge"}
 ARCHITECTURE = {"tower", "castle", "house", "building"}
+TREES = {"tree", "pine", "treehouse"}   # trunk + canopy, read by colour (reference_trees): method "tree"
+TREE_MIN_CANOPY = 0.12        # share of the outline that must be leaves for the tree builder
+CANOPY_DEPTH = 0.8            # a canopy's depth front to back, as a share of its width
 BLOCKS = {"building"}         # flat walls, square corners and a stepped roofline: modelled as "block"
 ROOF_STEP = 0.06              # roofline changes smaller than this share of the height are the same roof
 FOLIAGE = {"bush", "thorns", "flower", "grass"}
@@ -72,7 +75,7 @@ ROUND_MIN_SYMMETRY = 0.68     # below this, spinning an outline makes a vase out
 UNSURE_QUALITY = 0.68         # the outline model's own confidence
 UNSURE_ROUGHNESS = 14.0       # a tangled outline (see reference_objects.roughness)
 # depth of a slab as a share of its width; buildings are deep, signs are thin
-SLAB_DEPTH = {"house": 0.45, "castle": 0.5, "wall": 0.14, "fence": 0.06, "gate": 0.14, "prop_card": 0.06,
+SLAB_DEPTH = {"house": 0.45, "castle": 0.5, "treehouse": 0.5, "wall": 0.14, "fence": 0.06, "gate": 0.14, "prop_card": 0.06,
               "character": 0.16, "creature": 0.22, "floating": 0.08, "building": 0.5, "sign": 0.05,
               "vehicle": 0.45}
 # how far an inflated shape puffs out, relative to a perfectly round cross-section
@@ -116,7 +119,7 @@ def choose_method(obj, grid, aspect):
     if category in ARCHITECTURE:
         return "composite"
     unsure = (obj.get("quality", 1.0) < UNSURE_QUALITY or obj.get("roughness", 0.0) > UNSURE_ROUGHNESS)
-    if category in FOLIAGE or (unsure and category not in ({"tree", "pine", "log"} | MADE)):
+    if category in FOLIAGE or (unsure and category not in ({"tree", "pine", "log", "treehouse"} | MADE)):
         return "cluster"
     wanted = method_for(category, aspect)
     if wanted == "lathe" and symmetry(grid) < ROUND_MIN_SYMMETRY:
@@ -476,6 +479,147 @@ def cluster(mask, seed=1, max_balls=60):
     return _join(meshes)
 
 
+def foliage_grid(rgba, grid):
+    """Which cells of an outline's grid are leaves (reference_trees colour classes, majority vote)."""
+    import reference_trees
+    h, w = rgba.shape[:2]
+    gh, gw = grid.shape
+    on = rgba[..., 3] >= 96
+    leaves, _bark = reference_trees.colour_classes(rgba[..., :3])
+    rows = np.minimum((np.arange(h) * gh) // h, gh - 1)
+    cols = np.minimum((np.arange(w) * gw) // w, gw - 1)
+    ys, xs = np.nonzero(on)
+    total = np.zeros(grid.shape)
+    green = np.zeros(grid.shape)
+    np.add.at(total, (rows[ys], cols[xs]), 1.0)
+    np.add.at(green, (rows[ys], cols[xs]), leaves[ys, xs].astype(np.float64))
+    return grid & (green >= 0.5 * np.maximum(total, 1.0))
+
+
+def leaves_grid(obj, grid, rgba):
+    """The canopy part of an outline's grid: the recogniser's own canopy mask when it saved one
+    (a treehouse's vines are not its canopy), else the leaf colours."""
+    path = obj.get("leaves")
+    if path and Path(path).is_file():
+        alpha = load_rgba(path)[..., 3]
+        if alpha.shape == rgba.shape[:2]:
+            cells = silhouette_grid(alpha, max(grid.shape), threshold=128)
+            if cells.shape == grid.shape:
+                return grid & cells
+    return foliage_grid(rgba, grid)
+
+
+def canopy_balls(mask, seed=1, depth_ratio=CANOPY_DEPTH, max_balls=40):
+    """Leaf clumps filling a canopy's volume: the painted outline from the front, round from the side.
+
+    Layers of clumps (middle, then front and back); each stays inside the outline, so the silhouette
+    from the painter's side is kept while the canopy gets real depth.  Padded-grid coordinates.
+    """
+    grid = _thicken_thin(_pad(mask))
+    dist = distance_to_edge(grid)
+    peak = max(1.0, float(dist.max()))
+    h, w = grid.shape
+    cols = np.nonzero(grid.any(0))[0]
+    if not len(cols):
+        return np.zeros((0, 3)), []
+    cx = (cols.min() + cols.max()) / 2.0
+    half_w = max(1.0, (cols.max() - cols.min() + 1) / 2.0)
+    rows = np.nonzero(grid.any(1))[0]
+    cy = (rows.min() + rows.max()) / 2.0
+    half_h = max(1.0, (rows.max() - rows.min() + 1) / 2.0)
+    half_depth = half_w * depth_ratio
+    rng = np.random.default_rng(seed)
+    ys, xs = np.mgrid[0:h, 0:w]
+    # one continuous body under the clumps, so no clump floats free of the rest
+    meshes = [inflate(mask, 0.7)]
+    # a thin canopy (an overhang) needs more layers of clumps to fill its depth than a round crown
+    layers = int(np.clip(round(1.5 * half_depth / (0.6 * peak)) + 1, 3, 9))
+    offsets = sorted(np.linspace(-0.75, 0.75, layers if layers % 2 else layers + 1), key=abs)
+    spacing = 1.5 / max(1, len(offsets) - 1)
+    for layer, offset in enumerate(offsets):
+        shrink = 1.0 if layer == 0 else 0.8
+        # each layer picks its own spots, or the clumps line up in rows seen from the side
+        remaining = dist * (rng.uniform(0.7, 1.0, dist.shape) if layer else 1.0)
+        for _ in range(max_balls if layer == 0 else max_balls // 2):
+            spot = int(np.argmax(remaining))
+            row, col = spot // w, spot % w
+            if remaining[row, col] < max(1.2, peak * 0.15):
+                break
+            radius = float(dist[row, col]) * shrink
+            # the crown is an ellipsoid: deepest in its middle, thin at its sides, top and bottom
+            across, up = (col - cx) / half_w, (row - cy) / half_h
+            depth_here = half_depth * math.sqrt(max(0.05, 1.0 - across * across)) * math.sqrt(max(0.1, 1.0 - up * up))
+            place = offset + float(rng.uniform(-0.5, 0.5)) * spacing if layer else offset
+            y = place * max(0.0, depth_here - radius * 0.5)
+            meshes.append(_ball(float(col), y, float(h - 1 - row), radius * 1.05))
+            remaining[(xs - col) ** 2 + (ys - row) ** 2 < (radius * 0.9) ** 2] = 0.0
+    return _join(meshes) if meshes else (np.zeros((0, 3)), [])
+
+
+def _largest_parts(mask, min_share=0.02):
+    """The mask without specks (pieces smaller than min_share of it)."""
+    import reference_trees
+    labels, count = reference_trees.components(mask)
+    out = np.zeros_like(mask)
+    total = max(1, int(mask.sum()))
+    for n in range(1, count + 1):
+        piece = labels == n
+        if piece.sum() >= max(4, min_share * total):
+            out |= piece
+    return out
+
+
+def attached(pieces, anchor, reach=2):
+    """The parts of ``pieces`` that touch ``anchor`` (within ``reach`` cells), and what they touch in turn."""
+    import reference_trees
+    if not anchor.any():
+        return pieces
+    labels, count = reference_trees.components(pieces)
+    near = _max_filter(anchor.astype(np.float64), reach) > 0.0
+    keep = np.zeros_like(pieces)
+    changed = True
+    while changed:
+        changed = False
+        for n in range(1, count + 1):
+            piece = labels == n
+            if not keep[piece].any() and (piece & near).any():
+                keep |= piece
+                near |= _max_filter(piece.astype(np.float64), reach) > 0.0
+                changed = True
+    return keep
+
+
+def tree_mesh(grid, leaves, category="tree", seed=1):
+    """A tree: a round trunk (or a treehouse's house round its trunk) under a canopy of leaf clumps.
+
+    Leaves that don't hang off the trunk or the main canopy are left out: they would float.
+    """
+    wood = _largest_parts(grid & ~leaves)
+    canopy = _largest_parts(leaves)
+    if canopy.any():
+        import reference_trees
+        labels, count = reference_trees.components(canopy)
+        sizes = [int((labels == n).sum()) for n in range(1, count + 1)]
+        main = labels == (1 + int(np.argmax(sizes)))
+        canopy = attached(canopy, wood | main)
+    if wood.any() and canopy.any():
+        wood = attached(wood, canopy | _largest_parts(wood, 0.3))
+    meshes = []
+    if wood.any():
+        if category == "treehouse":
+            verts, faces = composite(wood, SLAB_DEPTH["treehouse"])
+            meshes.append((verts + np.array([0.5, 0.0, 0.0]), faces))      # lathe coords -> padded grid
+        else:
+            meshes.append(inflate(wood, 0.95))
+    if canopy.any():
+        verts, faces = canopy_balls(canopy, seed)
+        if len(verts):
+            meshes.append((verts, faces))
+    if not meshes:
+        return inflate(grid, INFLATE_DEPTH.get(category, 0.85))
+    return _join(meshes)
+
+
 def _smooth_1d(values, passes):
     out = values.astype(np.float64)
     for _ in range(passes):
@@ -727,6 +871,13 @@ def build_object(obj, out_dir, camera, index):
     method = choose_method(obj, grid, h / float(max(1, w)))
     if method == "ground" and (not obj.get("bbox") or obj["bbox"][1] < camera["horizon"] + 0.03 * camera["H"]):
         method = "slab"                 # it crosses the horizon, so it is standing up
+    leaves = None
+    if category in TREES and not obj.get("method"):
+        leaves = leaves_grid(obj, grid, rgba)
+        if leaves.sum() >= TREE_MIN_CANOPY * grid.sum():
+            method = "tree"             # trunk and canopy are built differently
+        elif category == "treehouse":
+            method = "composite"        # no leaves to be seen: it is the house
     relief = None
     if obj.get("relief") is not None:
         relief = np.asarray(obj["relief"], np.float64)
@@ -745,6 +896,10 @@ def build_object(obj, out_dir, camera, index):
         verts, faces = block(grid, SLAB_DEPTH.get(category, 0.5))
     elif method == "cluster":
         verts, faces = cluster(grid, seed=index + 1)
+    elif method == "tree":
+        if leaves is None:
+            leaves = leaves_grid(obj, grid, rgba)
+        verts, faces = tree_mesh(grid, leaves, category, seed=index + 1)
     elif method == "slab":
         verts, faces = slab(grid, SLAB_DEPTH.get(category, 0.15))
     else:
@@ -771,9 +926,10 @@ def build_object(obj, out_dir, camera, index):
         "id": obj.get("id", name), "name": name, "label": obj.get("label", category), "category": category,
         "method": method, "mesh": raw, "raw_mesh": raw, "art": art, "front_art": art, "thumb": thumb,
         "cutout": obj["cutout"], "cut_size": [w, h], "projection": projection,
-        "wrap_art": category in ARCHITECTURE, "detail": detail,
+        "wrap_art": category in ARCHITECTURE or method == "tree", "detail": detail,
+        "lookalike": obj.get("lookalike"),
         "size": [float(np.ptp(verts[:, i])) for i in range(3)],
-        "budget": int(max(600, min(14000 if category in ARCHITECTURE else 9000,
+        "budget": int(max(600, min(14000 if category in ARCHITECTURE | {"treehouse"} else 9000,
                                    600 + 60000 * float(obj.get("area", 0.05))))),
         "tris_raw": sum(len(f) - 2 for f in faces),
     }
@@ -937,6 +1093,8 @@ def build_all(objects, out_dir, camera, use_blender=True, strokes=None, strength
                             sort_keys=True).encode())
     for obj in objects:
         st = os.stat(obj["cutout"])
+        if obj.get("leaves") and Path(obj["leaves"]).is_file():
+            stamp.update(("%s|%d" % (obj["leaves"], int(os.stat(obj["leaves"]).st_mtime))).encode())
         stamp.update(("%s|%s|%s|%s|%s|%s|%s|%s|%d|%d" % (obj["cutout"], obj.get("category"), obj.get("method"),
                                                  obj.get("quality"), obj.get("roughness"), obj.get("detail", 1.0),
                                                  json.dumps(obj.get("source"), sort_keys=True), obj.get("own_look"),

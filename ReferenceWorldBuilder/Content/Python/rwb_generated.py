@@ -255,6 +255,7 @@ def build_models(objects, camera, picture_name, cache_dir, helper, script, use_b
             "refined": bool(entry.get("refined")),
             "native_cm_per_unit": entry["size"][2] and (bounds.box_extent.z * 2.0) / entry["size"][2],
             "own_look": bool(entry.get("own_look")), "source_name": entry.get("source_name"),
+            "category": entry.get("category"), "lookalike": entry.get("lookalike"),
         }
     record_path.write_text(json.dumps(record), encoding="utf-8")
     return models, report
