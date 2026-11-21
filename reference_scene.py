@@ -37,6 +37,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import numpy as np  # noqa: E402
+import reference_png  # noqa: E402
 import pygame  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
@@ -81,7 +82,7 @@ def _to_rgb(surf):
 def _save_rgba(array, path):
     h, w = array.shape[:2]
     surf = pygame.image.frombuffer(np.ascontiguousarray(array, np.uint8).tobytes(), (w, h), "RGBA")
-    pygame.image.save(surf, str(path))
+    reference_png.save(surf, str(path))
     return str(path)
 
 
@@ -100,8 +101,13 @@ def _resize(a, w, h):
     if a.ndim == 3:
         wy = wy[..., None]
         wx = wx[..., None]
-    top = a[y0][:, x0] * (1 - wx) + a[y0][:, x1] * wx
-    bottom = a[y1][:, x0] * (1 - wx) + a[y1][:, x1] * wx
+    # Exactly the old arithmetic (float64, columns then rows), with each row gather done once.
+    # Keep it bit for bit: the detector is sensitive enough that 1e-7 changes (float32) changed
+    # which objects it found.
+    top_rows, bottom_rows = a[y0], a[y1]
+    keep_x = 1 - wx
+    top = top_rows[:, x0] * keep_x + top_rows[:, x1] * wx
+    bottom = bottom_rows[:, x0] * keep_x + bottom_rows[:, x1] * wx
     return top * (1 - wy) + bottom * wy
 
 
@@ -126,6 +132,10 @@ def _hsv(rgb):
 def _model_path():
     if LOCAL_MODEL.is_file():
         return LOCAL_MODEL
+    import reference_objects
+    cached = reference_objects.hf_cached(MODEL_REPO, MODEL_FILE)
+    if cached is not None:
+        return cached
     from huggingface_hub import hf_hub_download
     return Path(hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE))
 
@@ -256,7 +266,7 @@ def prepare(image_path, cache_dir):
     surf = _surface(image_path)
     texture_surf = _scaled(surf, TEXTURE_LONG)
     texture = cache_dir / "scene_image.png"
-    pygame.image.save(texture_surf, str(texture))
+    reference_png.save(texture_surf, str(texture))
     rgb = _to_rgb(_scaled(surf, WORK_LONG))
     np.save(cache_dir / "rgb.npy", rgb)
     disp, depth_info = estimate_depth(rgb, cache_dir, stamp)
@@ -314,26 +324,77 @@ def _blur(values, passes=1):
     return out
 
 
+def label(mask):
+    """4-connected regions of a bool map: (int32 label map, 0 = none, count).
+
+    Regions are numbered in the order a row-by-row scan first meets them.  Works on runs of pixels
+    along each row (numpy throughout) instead of pixel by pixel, which was the slow part of the analysis.
+    """
+    mask = np.asarray(mask, bool)
+    h, w = mask.shape
+    labels = np.zeros((h, w), np.int32)
+    if not mask.any():
+        return labels, 0
+    padded = np.zeros((h, w + 2), np.int8)
+    padded[:, 1:-1] = mask
+    step = np.diff(padded, axis=1)
+    run_row, run_start = np.nonzero(step == 1)          # row-major order: runs sorted by row, then column
+    _end_row, run_end = np.nonzero(step == -1)          # exclusive ends, paired with the starts
+    n = len(run_row)
+    width = w + 2
+    start_key = run_row.astype(np.int64) * width + run_start
+    end_key = run_row.astype(np.int64) * width + run_end
+    # runs in the row above that overlap each run: ends after its start and starts before its end
+    above = run_row > 0
+    below_idx = np.nonzero(above)[0]
+    prev = (run_row[below_idx] - 1).astype(np.int64) * width
+    lo = np.searchsorted(end_key, prev + run_start[below_idx], side="right")
+    hi = np.searchsorted(start_key, prev + run_end[below_idx], side="left")
+    counts = np.maximum(0, hi - lo)
+    a = np.repeat(below_idx, counts)
+    offsets = np.repeat(lo - np.concatenate([[0], np.cumsum(counts)[:-1]]), counts)
+    b = offsets + np.arange(counts.sum())
+    # union by repeated min-label propagation + pointer jumping
+    root = np.arange(n)
+    if len(a):
+        while True:
+            low = np.minimum(root[a], root[b])
+            before = root.copy()
+            np.minimum.at(root, a, low)
+            np.minimum.at(root, b, low)
+            while True:
+                jumped = root[root]
+                if np.array_equal(jumped, root):
+                    break
+                root = jumped
+            if np.array_equal(root, before):
+                break
+    # number regions by first appearance (runs are already in scan order)
+    uniq, first = np.unique(root, return_index=True)
+    order = np.argsort(first)
+    number = np.empty(n, np.int32)
+    number_of_root = np.empty(len(uniq), np.int32)
+    number_of_root[order] = np.arange(1, len(uniq) + 1, dtype=np.int32)
+    number[:] = number_of_root[np.searchsorted(uniq, root)]
+    lengths = run_end - run_start
+    flat = np.repeat(run_row.astype(np.int64) * w + run_start - np.concatenate([[0], np.cumsum(lengths)[:-1]]),
+                     lengths) + np.arange(lengths.sum())
+    labels.ravel()[flat] = np.repeat(number, lengths)
+    return labels, int(len(uniq))
+
+
 def _components(mask):
-    n_rows, n_cols = mask.shape
-    seen = np.zeros_like(mask)
-    comps = []
-    for r in range(n_rows):
-        for c in range(n_cols):
-            if not mask[r, c] or seen[r, c]:
-                continue
-            stack = [(r, c)]
-            seen[r, c] = True
-            cells = []
-            while stack:
-                y, x = stack.pop()
-                cells.append((y, x))
-                for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
-                    if 0 <= ny < n_rows and 0 <= nx < n_cols and mask[ny, nx] and not seen[ny, nx]:
-                        seen[ny, nx] = True
-                        stack.append((ny, nx))
-            comps.append(cells)
-    return comps
+    """4-connected regions of a bool map as lists of (row, col) cells, in scan order of their first cell."""
+    labels, count = label(mask)
+    if not count:
+        return []
+    flat = labels.ravel()
+    idx = np.nonzero(flat)[0]
+    idx = idx[np.argsort(flat[idx], kind="stable")]
+    bounds = np.searchsorted(flat[idx], np.arange(1, count + 2))
+    w = labels.shape[1]
+    rows, cols = (idx // w).tolist(), (idx % w).tolist()
+    return [list(zip(rows[bounds[k]:bounds[k + 1]], cols[bounds[k]:bounds[k + 1]])) for k in range(count)]
 
 
 def _category(colors, height_cm):

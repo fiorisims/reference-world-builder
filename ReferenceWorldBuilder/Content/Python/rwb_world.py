@@ -26,6 +26,7 @@ import unreal
 import rwb_generated
 import rwb_layers
 import rwb_layout
+import rwb_fairies
 import rwb_library
 import rwb_street
 
@@ -37,10 +38,10 @@ PRIORS = {
     "wall": ("h", 300), "fence": ("h", 110), "bridge": ("w", 700), "gate": ("h", 420), "pillar": ("h", 380),
     "lantern": ("h", 260), "furniture": ("h", 110), "character": ("h", 175), "creature": ("h", 110),
     "prop_card": ("h", 160), "unknown": ("h", 200),
-    "building": ("h", 1500), "sign": ("h", 150), "vehicle": ("h", 150), "treehouse": ("h", 1400),
+    "building": ("h", 1500), "sign": ("h", 150), "vehicle": ("h", 150), "treehouse": ("h", 1400), "fairy": ("h", 40),
 }
 BASE_COUNTS = {
-    "tree": 16, "pine": 16, "bush": 12, "thorns": 10, "flower": 24, "grass": 30, "rock": 9, "cliff": 4,
+    "tree": 36, "pine": 36, "bush": 12, "thorns": 10, "flower": 24, "grass": 30, "rock": 9, "cliff": 4,
     "log": 5, "mushroom": 10, "lily": 12, "fence": 4, "lantern": 4, "pillar": 3, "furniture": 3, "house": 4,
     "tower": 2, "wall": 3,
 }
@@ -53,11 +54,16 @@ FALLBACK = {
 STRUCTURES = set(rwb_layers.STRUCTURES)
 FOREST = {"tree", "pine"}
 GRASS_LIFT = 2.0
-GRASS_CAP = 240               # grass models on a grassy map (they're individual actors)
+GRASS_CAP = 420               # grass models on a grassy map (they're individual actors)
+GRASS_MORE = 1.8              # more grass than the base amount (the artist asked for more)
+SCRIBBLE_TUFT = 0.5           # where the painted ground is scribbled this much or more, tufts come out small
 TOTAL_CAP = 650
 MAX_GENERATED = 60            # models built per picture (largest first)
 MAX_COUNT = 200               # copies of one model the panel may ask for
 LOOKALIKE_SHARE = 0.5         # of the extra trees around the view: new trees drawn in the painting's style
+LOOKALIKE_TALL = 1.5          # look-alikes stand this much taller than the generic tree size (PRIORS)
+LOOKALIKE_SPREAD = (0.85, 1.35)
+TREE_FOOTPRINT = 0.3          # of a tree's width kept clear for it: canopies may interleave, trunks may not
                               # (reference_trees); the rest come from the model library, for variety
 _world = {}                   # the last world built this session: lets the panel change it in place
 # what each kind of place does to the world (copied from reference_setting.SETTINGS, which can't be
@@ -566,6 +572,39 @@ def _plan(inv, camera):
     return plan
 
 
+def _spawn_fairy_at(ctx, record, colour, label, rng, wings):
+    """A painted fairy: a light with wings where it was painted, floating about that spot."""
+    placer = ctx["placer"]
+    place = record["place"]
+    x, y = placer.painted_spot(place["x"], place["y"], 20.0)
+    low, _spread = placer.ground(x, y, 20.0)
+    z = low + max(float(place.get("z") or 0.0), rwb_fairies.HOVER[0])
+    core, _floats = rwb_fairies.spawn_fairy(ctx, unreal.Vector(x, y, z), colour, label, rng, wings)
+    placer.add(x, y, 20.0)
+    record.update({"actor": core, "spot": (x, y, 20.0), "label": label})
+    return core
+
+
+def _float_fairies(ctx, camera, colours, wings, rng, count=rwb_fairies.EXTRA_FAIRIES):
+    """More fairies around the world (in front of the start and off to the sides), in the painted colours."""
+    placer = ctx["placer"]
+    made = tries = 0
+    for colour in rwb_fairies.colours_for_extras(colours, count):
+        while tries < count * 30:
+            tries += 1
+            x = rng.uniform(-camera.size / 3.0, camera.size / 3.0)
+            y = rng.uniform(-camera.size / 3.0, camera.size / 3.0)
+            if not placer.free(x, y, 30.0, gap=60.0):
+                continue
+            low, _spread = placer.ground(x, y, 30.0)
+            z = max(low, placer.water_z if placer.water_z is not None else low) + rng.uniform(*rwb_fairies.HOVER)
+            rwb_fairies.spawn_fairy(ctx, unreal.Vector(x, y, z), colour, "RWB_fairy_extra_%02d" % made, rng, wings)
+            placer.add(x, y, 30.0)
+            made += 1
+            break
+    return made
+
+
 def _job_objects(plan, camera, detail=1.0, lookalikes=()):
     """What the mesh builder needs, largest objects first, within the model budget.
 
@@ -575,8 +614,8 @@ def _job_objects(plan, camera, detail=1.0, lookalikes=()):
     jobs = []
     for number, record in enumerate(plan):
         inst = record["inst"]
-        if not inst.get("cutout"):
-            continue
+        if not inst.get("cutout") or record["category"] in rwb_fairies.FAIRY_CATEGORIES:
+            continue                                   # fairies are lights, not models
         record["model_id"] = "m%03d" % number
         jobs.append({
             "id": record["model_id"], "cutout": inst["cutout"], "category": record["category"],
@@ -1126,7 +1165,7 @@ def _scatter_extras(ctx, obj, models, generated, camera, density, area, rng, tot
     want = min(_target_count(obj, density, area) - obj["count"], TOTAL_CAP - total)
     made = tries = 0
     palettes = [i.get("colors") or {} for i in (obj.get("instances") or [])] or [{}]
-    while made < want and tries < want * 25:
+    while made < want and tries < want * (60 if category in FOREST else 25):
         tries += 1
         x = rng.uniform(-size / 2, size / 2)
         y = rng.uniform(-size / 2, size / 2)
@@ -1149,8 +1188,12 @@ def _scatter_extras(ctx, obj, models, generated, camera, density, area, rng, tot
             if model["method"] == "ground":
                 return made
             _axis, value = PRIORS.get(category, ("h", 200))
-            s = value * ctx["size"] * rng.uniform(0.8, 1.2) / model["height"]
-            r = max(model["width"], model["depth"]) * s * 0.5
+            if source == "lookalike":
+                value *= LOOKALIKE_TALL
+                s = value * ctx["size"] * rng.uniform(*LOOKALIKE_SPREAD) / model["height"]
+            else:
+                s = value * ctx["size"] * rng.uniform(0.8, 1.2) / model["height"]
+            r = max(model["width"], model["depth"]) * s * (TREE_FOOTPRINT if category in FOREST else 0.5)
             if not placer.free(x, y, r, gap=40.0):
                 continue
             low, _spread = placer.ground(x, y, r)
@@ -1236,8 +1279,16 @@ def _surface_here(surfaces, camera, x, y):
 GRASS_SURFACES = {"grass", "meadow"}
 
 
-def _grow_grass(ctx, surfaces, camera, library, density, area, rng):
-    """Grass and flower models where the picture's ground is grassy, in its own colours."""
+def scribble_keep(marks, roll):
+    """Inside the painted view grass follows the painter's scribbles: always some, most where marks are."""
+    return marks is None or roll < 0.2 + 0.8 * marks
+
+
+def _grow_grass(ctx, surfaces, camera, library, density, area, rng, scribbles=None):
+    """Grass and flower models where the picture's ground is grassy, in its own colours.
+
+    scribbles: the analysis's map of small marks on the painted ground (0..1 grid): grass gathers there,
+    in small tufts, like the scribbles it was drawn with."""
     placer = ctx["placer"]
     kinds = surfaces.get("surfaces") or []
     grassy = [s for s in kinds if s["name"] in GRASS_SURFACES]
@@ -1251,7 +1302,7 @@ def _grow_grass(ctx, surfaces, camera, library, density, area, rng):
     # a model's flat tint reads far darker than the same colour in paint: lift it, or dark painted
     # grass turns into black tufts
     colours = {s["name"]: "#%02X%02X%02X" % tuple(min(255, int(c * GRASS_LIFT + 25)) for c in s["color"]) for s in grassy}
-    want = int(min(GRASS_CAP, (60 + 240 * density) * area))
+    want = int(min(GRASS_CAP, (60 + 240 * density) * area * GRASS_MORE))
     made = tries = 0
     while made < want and tries < want * 12:
         tries += 1
@@ -1259,11 +1310,16 @@ def _grow_grass(ctx, surfaces, camera, library, density, area, rng):
         name = _surface_here(surfaces, camera, x, y)
         if name not in GRASS_SURFACES:
             continue
+        img = camera.to_image(x, y) if scribbles else None
+        marks = _sample_grid(scribbles, img[0], img[1]) if img else None
+        if not scribble_keep(marks, rng.random()):
+            continue
         # a meadow is the flowery kind
         pool = flower_models if name == "meadow" and flower_models and rng.random() < 0.5 else (grass_models or flower_models)
         model = rng.choice(pool)
         category = "flower" if model in flower_models else "grass"
-        scale, _target = _scale_for(model, category, ctx["size"], rng.uniform(0.7, 1.3))
+        small = 0.55 if marks is not None and marks >= SCRIBBLE_TUFT else 1.0
+        scale, _target = _scale_for(model, category, ctx["size"], rng.uniform(0.7, 1.3) * small)
         r = model["width"] * scale * 0.5
         if not placer.free(x, y, r, gap=4.0):
             continue
@@ -1483,6 +1539,8 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
     records = []
 
     # ---- every painted object, where it was painted
+    fairy_colours = []
+    fairy_wings = None                                 # imported on the first fairy (False if that failed)
     for number, record in enumerate(plan):
         wb._progress_message("Placing %d of %d objects where you painted them" % (number + 1, len(plan)),
                              92.0 + 7.0 * number / max(1, len(plan)))
@@ -1490,6 +1548,21 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
         title = record["obj"]["label"] if record["obj"].get("individual") else (record["inst"].get("label") or category)
         label = "RWB_%s_%02d" % (rwb_layers._safe(title, 22), number)
         model = generated.get(record.get("model_id"))
+        if category in rwb_fairies.FAIRY_CATEGORIES:
+            if fairy_wings is None:
+                try:
+                    fairy_wings = rwb_fairies.wings_texture(ctx, cache_dir) or False
+                except Exception:
+                    fairy_wings = False
+            colour = rwb_fairies.glow_colour(record["inst"].get("colors"))
+            fairy_colours.append(colour)
+            try:
+                _spawn_fairy_at(ctx, record, colour, label, rng, fairy_wings or None)
+                tally["fairy light"] = tally.get("fairy light", 0) + 1
+                total += 1
+            except Exception as error:                 # a fairy must never stop the build
+                report.append("%s: fairy light not made (%s)" % (title, str(error)[:120]))
+            continue
         if model:
             _spawn_generated(ctx, model, record, label)
             records.append(record)
@@ -1502,6 +1575,15 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
                 models = list(library.get(other, []))
             report.append(_spawn_fallback(ctx, record, models, label, cache_dir, rng))
         total += 1
+    if fairy_colours and values.get("extra_copies", True):
+        try:
+            floated = _float_fairies(ctx, camera, fairy_colours, fairy_wings or None, rng)
+        except Exception as error:
+            floated = 0
+            report.append("extra fairies not made (%s)" % str(error)[:120])
+        total += floated
+        report.append("fairies: %d painted, %d more floating around the world, as coloured lights with wings"
+                      % (len(fairy_colours), floated))
     if tally:
         report.insert(0, "New 3D models, placed as painted: " + ", ".join(
             "%s x%d" % (k, v) if v > 1 else k for k, v in sorted(tally.items())))
@@ -1539,13 +1621,6 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
         if got < wanted:
             short.append("%s: room for %d of %d" % (record["inst"].get("label") or record["category"], got, wanted))
     report += short
-
-    # ---- grass grows where the ground is grassy
-    if values.get("grow_grass", True) and setting["grass"]:
-        grown = _grow_grass(ctx, surfaces, camera, library, density, area, rng)
-        total += grown
-        if grown:
-            report.append("grass: %d plants on the grassy ground" % grown)
 
     # ---- painted masses, then extra copies outside the view
     by_category = {}
@@ -1589,6 +1664,13 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
         if made:
             report.append("%s: %d extra copies outside the painted view%s" % (
                 category, made, " (seen %d times)" % obj["count"] if obj["count"] else ""))
+
+    # ---- grass last: it fills in round the trees (grown first, its tufts left no room for a forest)
+    if values.get("grow_grass", True) and setting["grass"]:
+        grown = _grow_grass(ctx, surfaces, camera, library, density, area, rng, inv.get("scribbles"))
+        total += grown
+        if grown:
+            report.append("grass: %d plants on the grassy ground" % grown)
 
     try:
         import rwb_scene

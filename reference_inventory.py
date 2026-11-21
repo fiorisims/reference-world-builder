@@ -29,13 +29,14 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import numpy as np  # noqa: E402
+import reference_png  # noqa: E402
 
 import rwb_progress  # noqa: E402
 import reference_layers as rl  # noqa: E402
 import reference_objects  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
-INVENTORY_VERSION = "rwb-inventory-7"
+INVENTORY_VERSION = "rwb-inventory-8"
 WATER_GRID = 72           # terrain follows the shore much better than the old 24 x 24 grid
 MAX_LAYER_LOOKS = 24      # PSD layers recognised from pixels per analysis (about 3 s each)
 GENERIC_MIN_SCORE = 0.15  # a "Layer 3" must look like something, or it is paint rather than an object
@@ -241,7 +242,7 @@ def water_tile(texture, water_grid, path):
     if tile is None:
         return None
     out = np.clip(tile, 0, 255).astype(np.uint8)
-    pygame.image.save(pygame.image.frombuffer(out.tobytes(), (512, 512), "RGB"), str(path))
+    reference_png.save(pygame.image.frombuffer(out.tobytes(), (512, 512), "RGB"), str(path))
     return str(path)
 
 
@@ -254,6 +255,78 @@ def _grid_from_mask(mask, size=24):
                         int(gx * w / size):max(int(gx * w / size) + 1, int((gx + 1) * w / size))]
             out[gy][gx] = round(float(cell.mean()), 3)
     return out
+
+
+SCRIBBLE_GRID = 48           # cells across the picture for the scribble map
+SCRIBBLE_MIN_GROUND = 0.3    # share of a cell that must be open ground to count
+
+
+def scribble_grid(rgb, horizon, blockers=None, size=SCRIBBLE_GRID):
+    """Where the painted ground is covered in small marks (grass strokes, flecks, scribbles), 0..1 per
+    cell, size x size over the whole picture (0 above the horizon, on objects and on water).
+
+    Fine marks = luminance minus a small blur, so broad shading doesn't count; normalised so the most
+    scribbled ground is 1."""
+    import reference_trees
+    H, W = rgb.shape[:2]
+    lum = np.asarray(rgb, np.float64) @ np.array([0.299, 0.587, 0.114])
+    marks = np.abs(lum - reference_trees._blur(lum, 3))
+    ground = np.zeros((H, W), bool)
+    ground[int(max(0, horizon)):] = True
+    if blockers is not None:
+        ground &= ~blockers
+    out = np.zeros((size, size))
+    for gy in range(size):
+        y0, y1 = int(gy * H / size), max(int(gy * H / size) + 1, int((gy + 1) * H / size))
+        for gx in range(size):
+            x0, x1 = int(gx * W / size), max(int(gx * W / size) + 1, int((gx + 1) * W / size))
+            cell = ground[y0:y1, x0:x1]
+            if cell.mean() >= SCRIBBLE_MIN_GROUND:
+                out[gy, gx] = marks[y0:y1, x0:x1][cell].mean()
+    seen = out[out > 0]
+    if not len(seen):
+        return None
+    top = float(np.percentile(seen, 95))
+    return np.round(np.clip(out / max(top, 1e-6), 0.0, 1.0), 3).tolist()
+
+
+FLOATING = {"boat", "lily"}   # sit ON the water: the water goes on under them
+WATER_TOUCH = 0.02           # of the picture's width: a floater this close to water is on it
+
+
+def join_water(water, found, H, W):
+    """One body of water where the painting shows one: a canoe or lily pad painted over the water hides
+    water, not land, so the water continues under it and the pieces it touches join up.
+    (Islands stay islands: only floating things are filled in.)  Returns (mask, pieces before, after)."""
+    import reference_scene
+    import reference_trees
+    _labels, before = reference_scene.label(water)
+    if before == 0:
+        return water, 0, 0
+    reach = max(1, int(round(WATER_TOUCH * W)))
+    near = reference_trees._blur(water.astype(np.float64), reach) > 0.0
+    out = water.copy()
+    for item in found:
+        if item.get("category") not in FLOATING or not item.get("cutout") or not item.get("bbox"):
+            continue
+        x0, y0, x1, y1 = [int(round(v)) for v in item["bbox"]]
+        x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        outline = _cutout_alpha(item["cutout"], x1 - x0, y1 - y0)
+        if outline is None:
+            continue
+        mask = np.zeros((H, W), bool)
+        mask[y0:y1, x0:x1] = outline
+        rows = np.nonzero(water[:, x0:x1].any(1))[0]
+        if not len(rows):
+            continue
+        mask[:max(0, int(rows.min()) - reach)] = False   # reeds and stalks above the water stay dry
+        if (mask & near).any():
+            # under the boat, and the narrow band between it and the water it floats in
+            out |= mask | (reference_trees._blur(mask.astype(np.float64), reach) > 0.0) & near
+    _labels, after = reference_scene.label(out)
+    return out, before, after
 
 
 def _merge_grids(grids):
@@ -435,7 +508,7 @@ def _full_picture(image_path, cache_dir):
             surf = surf.convert(24) if hasattr(surf, "convert") and pygame.display.get_surface() else surf
         surf = pygame.transform.smoothscale(surf, (max(1, int(w * scale)), max(1, int(h * scale))))
     path = Path(cache_dir).resolve() / "picture_full.png"
-    pygame.image.save(surf, str(path))
+    reference_png.save(surf, str(path))
     return surf, str(path)
 
 
@@ -450,7 +523,7 @@ def sign_board(surf, box_frac, path, margin=SIGN_MARGIN):
     x1, y1 = max(x0 + 2, x1), max(y0 + 2, y1)
     crop = pygame.Surface((x1 - x0, y1 - y0), pygame.SRCALPHA, 32)
     crop.blit(surf, (0, 0), pygame.Rect(x0, y0, x1 - x0, y1 - y0))
-    pygame.image.save(crop, str(path))
+    reference_png.save(crop, str(path))
     return {"texture": str(path), "box_frac": [x0 / float(W), y0 / float(H), x1 / float(W), y1 / float(H)],
             "pixels": [x1 - x0, y1 - y0]}
 
@@ -564,7 +637,27 @@ def _depth_and_buildings(objects, rgb, horizon, disp, floor, full_picture, cache
 TREE_KINDS = {"tree", "treehouse"}
 
 
-def tree_lookalikes(objects, rgb, horizon, cache_dir, setting_info):
+def _tree_tiles(reference_trees, rgb, canopies, others, horizon, image_path, cache_dir):
+    """Bark and leaf tiles for look-alikes, quilted from the full-size picture: the working copy is too
+    small to hold the brush marks."""
+    full = None
+    if image_path:
+        import pygame
+        surf, _png = _full_picture(image_path, cache_dir)
+        if surf is not None:
+            full = np.frombuffer(pygame.image.tobytes(surf, "RGB"), np.uint8).reshape(surf.get_height(), surf.get_width(), 3)
+    if full is None:
+        return reference_trees.texture_tiles(rgb, canopies, others, horizon)
+    H, W = rgb.shape[:2]
+    FH, FW = full.shape[:2]
+    rows = np.minimum(np.arange(FH) * H // FH, H - 1)
+    cols = np.minimum(np.arange(FW) * W // FW, W - 1)
+    grow = lambda m: None if m is None else m[rows][:, cols]
+    return reference_trees.texture_tiles(full, [grow(c) for c in canopies], grow(others),
+                                         None if horizon is None else horizon * FH / float(H))
+
+
+def tree_lookalikes(objects, rgb, horizon, cache_dir, setting_info, image_path=None):
     """The picture's tree style and new trees drawn in it (reference_trees), for the forest around.
 
     Only for places that have trees: painted ones, or (outdoors) enough trunk-shaped paint.
@@ -600,7 +693,9 @@ def tree_lookalikes(objects, rgb, horizon, cache_dir, setting_info):
     style, bark_px, leaf_px = reference_trees.read_style(rgb, trees, canopies, others, horizon)
     if not trees and not (setting_info.get("forest") and style.get("trunks", 0) >= 3):
         return {"style": style, "line": "", "lookalikes": []}
-    made = reference_trees.lookalikes(style, bark_px, leaf_px, Path(cache_dir).resolve() / "lookalikes")
+    tiles = _tree_tiles(reference_trees, rgb, canopies, others, horizon, image_path, cache_dir)
+    made = reference_trees.lookalikes(style, bark_px, leaf_px, Path(cache_dir).resolve() / "lookalikes", tiles=tiles)
+    style["textured"] = [tile is not None for tile in tiles]
     return {"style": style, "line": reference_trees.line(style), "lookalikes": made}
 
 
@@ -637,6 +732,7 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
     objects = {}
     water_grids, hill_grids, missing = [], [], []
     water_checks = []                                  # every water candidate and what the check said
+    water_joined = None                                # (pieces, after joining them under boats)
     water_scene = {}
 
     def real_water(mask, source):
@@ -747,6 +843,9 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
                     "bbox_px": item["bbox"], "colors": _profile(rgb, item["bbox"]),
                 }, individual=item["category"] in INDIVIDUALS, label=item["label"])
             if water_mask is not None and water_mask.mean() > 0.01:
+                water_mask, pieces, joined = join_water(water_mask, found, H, W)
+                if joined < pieces:
+                    water_joined = (pieces, joined)
                 water_grids.append(_grid_from_mask(water_mask, WATER_GRID))
                 atmosphere.setdefault("water", rl._hex(rgb[water_mask].mean(0)))
             boxes = [o["box"] for e in objects.values() for o in e["instances"]]
@@ -868,7 +967,7 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
     if not setting_info.get("box"):                    # streets and rooms have no forest around them
         rwb_progress.report(0.89, "Reading the trees' style")
         try:
-            trees = tree_lookalikes(objects, rgb, horizon, cache_dir, setting_info)
+            trees = tree_lookalikes(objects, rgb, horizon, cache_dir, setting_info, image_path)
         except Exception as error:
             missing.append("tree style (%s)" % str(error)[:80])
     water = _merge_grids(water_grids)
@@ -886,6 +985,14 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
     except Exception as error:
         strokes = {"error": str(error)[:200]}
     ground = _ground_palette(rgb, horizon, boxes, water_mask)
+    scribbles = None
+    try:
+        blockers = _objects_mask(objects, H, W)
+        if water_mask is not None:
+            blockers = blockers | water_mask
+        scribbles = scribble_grid(rgb, horizon, blockers)
+    except Exception as error:
+        missing.append("scribble map (%s)" % str(error)[:80])
     if atmosphere.get("ground"):
         ground["colors"] = list(atmosphere["ground"])[:3]
     top = rgb[: max(1, int(min(horizon, H * 0.3)))].reshape(-1, 3)
@@ -894,7 +1001,9 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
         "version": INVENTORY_VERSION, "source": source, "info": info, "cache": str(cache_dir.resolve()),
         "objects": out_objects,
         "water": {"present": bool(water) and max(max(r) for r in water) > 0.25, "coverage": water,
-                  "checks": water_checks, "line": __import__("reference_water").line(water_checks),
+                  "checks": water_checks, "joined": water_joined,
+                  "line": __import__("reference_water").line(water_checks) + (
+                      "; %d pieces joined into %d under the boats and lily pads" % water_joined if water_joined else ""),
                   "color": atmosphere.get("water") or "#3E7FA6", "tile": tile_path},
         "hills": {"coverage": _merge_grids(hill_grids)},
         "ground": ground, "sky": sky, "fog": atmosphere.get("fog"), "accent": atmosphere.get("accent"),
@@ -907,6 +1016,7 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
         "depth": depth_info,
         "plate": depth_info.get("plate"),
         "trees": trees,
+        "scribbles": scribbles,
     }
 
 

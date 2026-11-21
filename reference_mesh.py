@@ -46,6 +46,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import numpy as np  # noqa: E402
+import reference_png  # noqa: E402
 
 import rwb_progress  # noqa: E402
 
@@ -720,7 +721,7 @@ def save_art(rgba, path, long_side=TEXTURE_LONG):
             filled |= new
         out[~filled] = rgba[..., :3][known].mean(0)
     surf = pygame.image.frombuffer(np.clip(out, 0, 255).astype(np.uint8).tobytes(), (w, h), "RGB")
-    pygame.image.save(surf, str(path))
+    reference_png.save(surf, str(path))
     return str(path)
 
 
@@ -731,7 +732,7 @@ def save_thumb(rgba, path, size=96):
     scale = size / float(max(h, w))
     surf = pygame.image.frombuffer(rgba.tobytes(), (w, h), "RGBA")
     surf = pygame.transform.smoothscale(surf, (max(1, int(w * scale)), max(1, int(h * scale))))
-    pygame.image.save(surf, str(path))
+    reference_png.save(surf, str(path))
     return str(path)
 
 
@@ -773,7 +774,7 @@ def bake_entry(entry, strokes, strength):
     rgb, direct = rs.bake(surface, art, detail, uv_of, method, per_unit, strength, size,
                           wrap_art=bool(entry.get("wrap_art")))
     path = Path(entry["front_art"]).with_name(entry["name"] + "_wrap.png")
-    pygame.image.save(pygame.image.frombuffer(rgb.tobytes(), (size, size), "RGB"), str(path))
+    reference_png.save(pygame.image.frombuffer(rgb.tobytes(), (size, size), "RGB"), str(path))
     entry["painted_share"] = round(direct, 3)
     return str(path)
 

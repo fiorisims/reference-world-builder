@@ -157,6 +157,18 @@
         "tree trunk"
       ]
     },
+    "fairy": {
+      "kind": "object",
+      "words": [
+        "fairy",
+        "fairies",
+        "fairy light",
+        "wisp",
+        "will-o-the-wisp",
+        "sprite",
+        "pixie"
+      ]
+    },
     "treehouse": {
       "kind": "object",
       "words": [
@@ -333,7 +345,6 @@
         "child",
         "kid",
         "baby",
-        "fairy",
         "witch",
         "sorceress",
         "villain",

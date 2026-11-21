@@ -29,6 +29,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import numpy as np  # noqa: E402
+import reference_png  # noqa: E402
 
 GROUPS = 6
 GRID = 72
@@ -468,7 +469,7 @@ def bake_ground(job):
             shore = np.clip(1.0 - (full - float(job["water_z"])) / 45.0, 0.0, 1.0)[..., None]
             out = out * (1.0 - 0.55 * shore) + np.array(job.get("shore_color", (120, 105, 80)), np.float32) * 0.55 * shore
     rgb = np.clip(out, 0, 255).astype(np.uint8)
-    pygame.image.save(pygame.image.frombuffer(rgb.tobytes(), (bake, bake), "RGB"), str(job["out"]))
+    reference_png.save(pygame.image.frombuffer(rgb.tobytes(), (bake, bake), "RGB"), str(job["out"]))
     return str(job["out"])
 
 

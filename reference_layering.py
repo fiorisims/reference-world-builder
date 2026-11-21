@@ -22,6 +22,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import reference_png  # noqa: E402
 
 TOUCH = 3                 # pixels: outlines this close touch
 MIN_EDGE = 8              # pixels of shared edge needed to judge who is in front
@@ -206,5 +207,5 @@ def plate(picture_path, standing, path):
     hole = _grow(hole, max(1, int(PLATE_GROW * max(W, H))))
     out = fill(rgb, hole)
     out = np.clip(out, 0, 255).astype(np.uint8)
-    pygame.image.save(pygame.image.frombuffer(out.tobytes(), (W, H), "RGB"), str(path))
+    reference_png.save(pygame.image.frombuffer(out.tobytes(), (W, H), "RGB"), str(path))
     return {"path": str(path), "share": round(float(hole.mean()), 3)}

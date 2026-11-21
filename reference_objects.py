@@ -25,6 +25,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 import numpy as np  # noqa: E402
+import reference_png  # noqa: E402
 
 import rwb_progress  # noqa: E402
 
@@ -39,7 +40,7 @@ CLIP_REPO = "Xenova/clip-vit-base-patch32"
 CLIP_VISION = "onnx/vision_model_quantized.onnx"
 CLIP_TEXT = "onnx/text_model_quantized.onnx"
 CLIP_TOKENIZER = "tokenizer.json"
-RECOGNIZER_VERSION = "rwb-objects-14"
+RECOGNIZER_VERSION = "rwb-objects-15"
 OWL_SIZE = 960
 SAM_SIZE = 1024
 SCORE_MIN = 0.10          # below this OWLv2 is guessing, even on paintings
@@ -52,7 +53,7 @@ MERGE_REACH = 0.2         # a fragment's centre may be this share of the buildin
 MERGE_TOUCH = 5           # pixels: how close counts as touching
 MERGE_MAX_SIZE = 0.45     # a fragment is smaller than this share of the building
 MERGE_MAX_DEPTH = 2.2     # a fragment further than this many times the building's distance is behind it
-MERGE_NEVER = {"mushroom", "floating", "character", "creature", "lily", "pine", "lantern"}
+MERGE_NEVER = {"mushroom", "floating", "fairy", "character", "creature", "lily", "pine", "lantern"}
 MAX_OBJECTS = 30
 CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], np.float32)
 CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], np.float32)
@@ -84,7 +85,10 @@ GROUP_NEVER = AREA_CATEGORIES   # one body of water holds patches of water: it i
 # these lie on the ground or water, so they cannot be above the horizon
 GROUNDED_CATEGORIES = {"boat", "lily", "bridge"}
 # these may hang or fly above the ground; anything else above the horizon is canopy or backdrop
-AIRBORNE_CATEGORIES = {"floating", "creature", "lantern", "prop_card", "sign"}
+AIRBORNE_CATEGORIES = {"floating", "fairy", "creature", "lantern", "prop_card", "sign"}
+GLOW_LIT = 0.25           # share of a flyer's box in bright, coloured paint for it to be a light
+GLOW_LIFT = 0.05          # ... and the box this much brighter than the paint around it
+GLOWING_KINDS = {"floating", "creature"}   # a glowing butterfly / bird / crystal in the air is a fairy
 AIRBORNE_MAX_AREA = 0.03  # share of the picture: a floater is small
 HORIZON_SLACK = 0.08      # standing objects may meet the ground this far above the horizon (hidden feet)
 
@@ -94,17 +98,64 @@ def _resize(a, w, h):
     return reference_scene._resize(a, w, h)
 
 
+def hf_cached(repo, name):
+    """A model file already in the Hugging Face cache, or None.
+
+    Looking it up directly skips importing huggingface_hub (3 s) and asking the server whether the
+    file changed (about 0.15 s per file, 19 files per analysis).
+    """
+    hub = os.environ.get("HF_HUB_CACHE")
+    if not hub:
+        home = os.environ.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
+        hub = str(Path(home) / "hub")
+    snapshots = Path(hub) / ("models--" + repo.replace("/", "--")) / "snapshots"
+    try:
+        found = [snap / name for snap in snapshots.iterdir() if (snap / name).is_file()]
+    except OSError:
+        return None
+    return max(found, key=lambda f: f.stat().st_mtime) if found else None
+
+
 def _file(repo, name, local_dir):
     local = ROOT / "models" / local_dir / Path(name).name
     if local.is_file():
         return local
+    cached = hf_cached(repo, name)
+    if cached is not None:
+        return cached
     from huggingface_hub import hf_hub_download
     return Path(hf_hub_download(repo_id=repo, filename=name))
 
 
+SMALL_MODEL_BYTES = 40_000_000   # SAM's encoder and decoder: run on 4 threads
+_SESSIONS = {}
+
+
+def threads_for(path):
+    """CPU threads for a model.  RWB_THREADS overrides.
+
+    Small models lose time keeping many threads in step: SAM's decoder took 0.19 s per outline on
+    8 threads and 0.05 s on 4 (on a laptop with 4 fast + 4 low-power cores).  Big ones gain from all.
+    """
+    forced = os.environ.get("RWB_THREADS")
+    if forced:
+        return max(1, int(forced))
+    try:
+        small = os.path.getsize(path) < SMALL_MODEL_BYTES
+    except OSError:
+        small = False
+    return min(4, os.cpu_count() or 4) if small else 0      # 0 = onnxruntime's default
+
+
 def _session(path):
-    import onnxruntime as ort
-    return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    """One onnxruntime session per model file for the whole run (loading took up to 6 s each time)."""
+    key = str(path)
+    if key not in _SESSIONS:
+        import onnxruntime as ort
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = threads_for(path)
+        _SESSIONS[key] = ort.InferenceSession(key, options, providers=["CPUExecutionProvider"])
+    return _SESSIONS[key]
 
 
 def load_queries(keywords_path=None):
@@ -278,6 +329,19 @@ def classify_crop(rgb, table, session=None):
 # --------------------------------------------------------------------------- #
 # outlines
 # --------------------------------------------------------------------------- #
+_SEGMENTERS = {}
+
+
+def segmenter_for(rgb):
+    """The Segmenter for this picture, encoded once per run (the floor and the objects share it)."""
+    a = np.ascontiguousarray(rgb)
+    key = (a.shape, hashlib.md5(a.tobytes()).hexdigest())
+    if key not in _SEGMENTERS:
+        _SEGMENTERS.clear()
+        _SEGMENTERS[key] = Segmenter(a)
+    return _SEGMENTERS[key]
+
+
 class Segmenter:
     """SlimSAM with one image encoded once and any number of box prompts."""
 
@@ -351,6 +415,43 @@ class Segmenter:
             logits = masks[i][:max(1, cut_h), :max(1, cut_w)]
             out.append((_resize(logits, self.W, self.H) > 0.0, float(quality[i])))
         return out
+
+
+def glow(rgb, box):
+    """How much of a box is bright, coloured paint (0..1), or 0 when the box isn't brighter than the paint
+    around it.  A painted fairy is a coloured light; a butterfly on a leaf isn't."""
+    H, W = rgb.shape[:2]
+    x0, y0, x1, y1 = [int(round(float(v))) for v in box]
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    pad = max(4, int(0.5 * max(x1 - x0, y1 - y0)))
+    rgbf = np.asarray(rgb, np.float32) / 255.0
+    value = rgbf.max(-1)
+    sat = (value - rgbf.min(-1)) / np.maximum(value, 1e-6)
+    inside = value[y0:y1, x0:x1]
+    around = value[max(0, y0 - pad):min(H, y1 + pad), max(0, x0 - pad):min(W, x1 + pad)]
+    if float(inside.mean()) < float(around.mean()) + GLOW_LIFT:
+        return 0.0
+    lit = (inside >= 0.75) & (sat[y0:y1, x0:x1] >= 0.2)
+    return float(lit.mean())
+
+
+def fairy_check(rgb, items):
+    """A butterfly, bird or crystal in the air that glows is a fairy (a small light with wings).
+    Returns ["butterfly -> fairy", ...]."""
+    changes = []
+    for item in items:
+        if item.get("category") not in GLOWING_KINDS or not item.get("box"):
+            continue
+        lit = glow(rgb, item["box"])
+        item["glow"] = round(lit, 3)
+        if lit >= GLOW_LIT:
+            changes.append("%s -> fairy" % item.get("label", item["category"]))
+            item["was"] = item["category"]
+            item["category"] = "fairy"
+            item["label"] = "fairy"
+    return changes
 
 
 FLOOR_VERSION = "rwb-floor-5"
@@ -439,7 +540,7 @@ def floor_mask(rgb, horizon, cache_dir=None, stamp="", segmenter=None):
                 return np.load(cache)
         except Exception:
             pass
-    seg = segmenter or Segmenter(rgb)
+    seg = segmenter or segmenter_for(rgb)
     bottom = [(W * f, H * 0.965) for f in (0.12, 0.5, 0.88)]
     lift = max(0.0, horizon - 0.14 * H)
     negative = [(W * 0.5, H * 0.04), (W * 0.06, lift), (W * 0.94, lift)]
@@ -743,7 +844,7 @@ def save_cutout(texture, mask, bbox, path, work_size):
     crop[..., :3] = texture[y0:y1, x0:x1, :3]
     crop[..., 3] = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
     surf = pygame.image.frombuffer(crop.tobytes(), (x1 - x0, y1 - y0), "RGBA")
-    pygame.image.save(surf, str(path))
+    reference_png.save(surf, str(path))
     return str(path)
 
 
@@ -815,7 +916,7 @@ def recognize(rgb, texture, cache_dir, stamp, keywords_path=None, disp=None, fit
     objects, areas, candidates = [], [], []
     if dets:
         rwb_progress.report(0.5, "Outlining %d possible objects" % len(dets))
-        segmenter = Segmenter(rgb)
+        segmenter = segmenter_for(rgb)
         dets.sort(key=lambda d: -d["score"])
         for number, d in enumerate(dets):
             rwb_progress.report(0.5 + 0.3 * number / float(len(dets)), "Outlining %d of %d" % (number + 1, len(dets)))
@@ -873,6 +974,9 @@ def recognize(rgb, texture, cache_dir, stamp, keywords_path=None, disp=None, fit
                 info += " + tree check (%s)" % ", ".join(changes[:4])
         except Exception as error:
             info += " (tree check failed: %s)" % str(error)[:80]
+        changes = fairy_check(rgb, candidates)
+        if changes:
+            info += " + glow check (%s)" % ", ".join(changes[:4])
         horizon_frac = None if horizon is None else horizon / float(H)
         # the detector saw the whole scene: a relabel from the close-up can't make something scenery
         candidates = [d for d in candidates if not (is_scenery(d["place"], d["category"], horizon_frac)

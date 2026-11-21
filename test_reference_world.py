@@ -1085,7 +1085,9 @@ def test_tree_reading():
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("scatter_source", "_job_objects")]
     nodes += [n for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") in ("MAX_GENERATED", "PRIORS",
                                                                                                          "SHAPE_ORDER", "LOOKALIKE_SHARE")]
-    scope = {"Path": Path}
+    sys.path.insert(0, str(HERE / "ReferenceWorldBuilder" / "Content" / "Python"))
+    import rwb_fairies
+    scope = {"Path": Path, "rwb_fairies": rwb_fairies}
     exec(compile(ast.Module(nodes, []), "rwb_world", "exec"), scope)
     import random
     rng = random.Random(4)
@@ -1763,6 +1765,214 @@ def default_image():
     return path
 
 
+def test_speedups():
+    """The faster labeller, resize, PNG writer and model loading give the same results as before."""
+    import os
+    import tempfile
+    import pygame
+    import reference_scene as rs
+    import reference_png
+    import reference_objects as ro
+
+    def flood(mask):
+        rows, cols = mask.shape
+        seen = np.zeros_like(mask)
+        comps = []
+        for r in range(rows):
+            for c in range(cols):
+                if not mask[r, c] or seen[r, c]:
+                    continue
+                stack, cells = [(r, c)], []
+                seen[r, c] = True
+                while stack:
+                    y, x = stack.pop()
+                    cells.append((y, x))
+                    for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                        if 0 <= ny < rows and 0 <= nx < cols and mask[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+                comps.append(sorted(cells))
+        return comps
+    rng = np.random.default_rng(5)
+    same = True
+    for _ in range(60):
+        h, w = rng.integers(1, 40, 2)
+        mask = rng.random((h, w)) < rng.random()
+        same &= flood(mask) == [sorted(c) for c in rs._components(mask)]
+    check("speed: the run labeller finds the same regions in the same order", same)
+    labels, count = rs.label(np.array([[1, 0, 1], [1, 0, 1], [1, 1, 1]], bool))
+    check("speed: a U shape is one region", count == 1 and labels[0, 0] == labels[0, 2] == 1, labels)
+    check("speed: an empty map has no regions", rs.label(np.zeros((4, 4), bool))[1] == 0)
+
+    def old_resize(a, w, h):
+        a = np.asarray(a, np.float32)
+        H, W = a.shape[:2]
+        ys = np.clip((np.arange(h) + 0.5) * H / float(h) - 0.5, 0, H - 1)
+        xs = np.clip((np.arange(w) + 0.5) * W / float(w) - 0.5, 0, W - 1)
+        y0, x0 = np.floor(ys).astype(int), np.floor(xs).astype(int)
+        y1, x1 = np.minimum(y0 + 1, H - 1), np.minimum(x0 + 1, W - 1)
+        wy, wx = (ys - y0)[:, None], (xs - x0)[None, :]
+        if a.ndim == 3:
+            wy, wx = wy[..., None], wx[..., None]
+        top = a[y0][:, x0] * (1 - wx) + a[y0][:, x1] * wx
+        bottom = a[y1][:, x0] * (1 - wx) + a[y1][:, x1] * wx
+        return top * (1 - wy) + bottom * wy
+    a = rng.random((37, 53, 3)).astype(np.float32) * 255
+    new, old = rs._resize(a, 90, 61), old_resize(a, 90, 61)
+    # bit for bit: 1e-7 differences changed which objects the detector found on Sleeping Beauty
+    check("speed: resize is bit-identical to the old one", np.array_equal(new, old) and new.dtype == old.dtype)
+    folder = Path(tempfile.mkdtemp())
+    pygame.display.init()
+    for name, arr in (("grey", rng.integers(0, 255, (9, 7), dtype=np.uint8)),
+                      ("rgb", rng.integers(0, 255, (9, 7, 3), dtype=np.uint8)),
+                      ("rgba", rng.integers(0, 255, (9, 7, 4), dtype=np.uint8))):
+        path = reference_png.save(arr, folder / (name + ".png"))
+        surf = pygame.image.load(path)
+        mode = "RGBA" if arr.ndim == 3 and arr.shape[2] == 4 else "RGB"
+        back = np.frombuffer(pygame.image.tobytes(surf, mode), np.uint8).reshape(9, 7, len(mode))
+        want = np.repeat(arr[..., None], 3, 2) if arr.ndim == 2 else arr
+        check("speed: PNG round trip (%s)" % name, np.array_equal(back, want))
+    rgba = rng.integers(0, 255, (6, 5, 4), dtype=np.uint8)
+    surf = pygame.image.frombuffer(rgba.tobytes(), (5, 6), "RGBA")
+    back = pygame.image.load(reference_png.save(surf, folder / "surf.png"))
+    check("speed: a see-through surface keeps its alpha", np.array_equal(
+        np.frombuffer(pygame.image.tobytes(back, "RGBA"), np.uint8).reshape(6, 5, 4), rgba))
+    small, big = folder / "small.onnx", folder / "big.onnx"
+    small.write_bytes(b"x" * 10)
+    with open(big, "wb") as f:
+        f.seek(ro.SMALL_MODEL_BYTES + 10)
+        f.write(b"x")
+    old_env = os.environ.pop("RWB_THREADS", None)
+    check("speed: small models run on at most 4 threads", 1 <= ro.threads_for(small) <= 4)
+    check("speed: big models use onnxruntime's default", ro.threads_for(big) == 0)
+    os.environ["RWB_THREADS"] = "2"
+    check("speed: RWB_THREADS overrides", ro.threads_for(big) == 2)
+    os.environ.pop("RWB_THREADS")
+    if old_env is not None:
+        os.environ["RWB_THREADS"] = old_env
+    hub = folder / "hub" / "models--some--repo" / "snapshots" / "abc" / "onnx"
+    hub.mkdir(parents=True)
+    (hub / "m.onnx").write_bytes(b"1")
+    old_hub = os.environ.get("HF_HUB_CACHE")
+    os.environ["HF_HUB_CACHE"] = str(folder / "hub")
+    found = ro.hf_cached("some/repo", "onnx/m.onnx")
+    missing = ro.hf_cached("some/repo", "onnx/nope.onnx")
+    if old_hub is None:
+        os.environ.pop("HF_HUB_CACHE")
+    else:
+        os.environ["HF_HUB_CACHE"] = old_hub
+    check("speed: cached models are found without asking the server", found is not None and found.name == "m.onnx")
+    check("speed: a missing model still goes to the hub", missing is None)
+    source = (HERE / "reference_objects.py").read_text(encoding="utf-8")
+    check("speed: the floor and the objects share one SAM encoding",
+          source.count("or segmenter_for(rgb)") + source.count("= segmenter_for(rgb)") == 2
+          and "Segmenter(rgb)" not in source)
+
+
+def test_round_two_notes():
+    """Textured, taller, more look-alikes; one lake under the boat; grass on the scribbles; fairies."""
+    import ast
+    import random
+    import tempfile
+    import pygame
+    import reference_trees as rt
+    import reference_inventory as ri
+    import reference_objects as ro
+    import reference_png
+    sys.path.insert(0, str(HERE / "ReferenceWorldBuilder" / "Content" / "Python"))
+    import rwb_fairies as rf
+    pygame.display.init()
+    rng = np.random.default_rng(3)
+    # --- look-alikes wear the painting's own brushwork
+    rgb, trunks, house, canopy = _forest_picture(h=400, w=520)
+    noisy = np.clip(rgb.astype(np.int16) + rng.integers(-8, 8, rgb.shape), 0, 255).astype(np.uint8)
+    bark_tile, leaf_tile = rt.texture_tiles(noisy, [canopy], house, 0.6 * 400)
+    check("notes: a leaf tile is quilted from the canopy",
+          leaf_tile is not None and leaf_tile.shape == (rt.TEXTURE_TILE, rt.TEXTURE_TILE, 3))
+    style = dict(rt.DEFAULT_STYLE)
+    flat = rt.paint_tree(style, None, None, 5)
+    textured = rt.paint_tree(style, None, None, 5, tiles=(bark_tile, leaf_tile))
+    leaves = textured[..., 3] > 0
+    check("notes: the textured tree has the same outline", np.array_equal(flat[..., 3], textured[..., 3]))
+    check("notes: the texture adds brush marks",
+          textured[leaves, :3].astype(float).std() > flat[leaves, :3].astype(float).std())
+    detail = rt._brushwork(leaf_tile if leaf_tile is not None else np.zeros((8, 8, 3)))
+    check("notes: brush marks keep no broad tone and no wild flecks",
+          abs(float(detail.mean())) < 3.0 and float(np.abs(detail).max()) <= rt.BRUSH_CLIP)
+    check("notes: more look-alike designs", rt.LOOKALIKES >= 6)
+    # --- one lake: water hidden by a canoe continues under it
+    H, W = 120, 200
+    water = np.zeros((H, W), bool)
+    water[60:110, 10:80] = True
+    water[60:110, 120:190] = True                   # two pieces with the canoe between them
+    folder = Path(tempfile.mkdtemp())
+    boat_alpha = np.zeros((30, 60, 4), np.uint8)
+    boat_alpha[..., 3] = 255
+    boat = reference_png.save(boat_alpha, folder / "boat.png")
+    reed_alpha = np.zeros((60, 20, 4), np.uint8)
+    reed_alpha[..., 3] = 255
+    reeds = reference_png.save(reed_alpha, folder / "reeds.png")
+    found = [{"category": "boat", "cutout": boat, "bbox": [70, 80, 130, 110]},
+             {"category": "lily", "cutout": reeds, "bbox": [20, 20, 40, 80]},
+             {"category": "tree", "cutout": boat, "bbox": [85, 60, 115, 80]}]
+    joined, before, after = ri.join_water(water, found, H, W)
+    check("notes: the canoe joins the two pieces into one lake", before == 2 and after == 1, (before, after))
+    check("notes: reeds above the water stay dry", not joined[20:50, 20:40].any())
+    check("notes: a tree on the bank doesn't flood", not joined[60:75, 90:110].any())
+    # --- grass gathers on the scribbles
+    ground = np.full((H, W, 3), 90, np.uint8)
+    ground[80:, 100:] = rng.integers(40, 160, (40, 100, 1))
+    grid = np.array(ri.scribble_grid(ground, 50, None, size=10))
+    check("notes: the sky has no scribbles", grid[:4].max() == 0.0)
+    check("notes: the scribbled corner scores highest", grid[8:, 6:].mean() > 3 * grid[5:7, :4].mean() + 0.2, grid)
+    source = (HERE / "ReferenceWorldBuilder" / "Content" / "Python" / "rwb_world.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("scribble_keep", "_job_objects")]
+    nodes += [n for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") in (
+        "BASE_COUNTS", "LOOKALIKE_TALL", "GRASS_MORE", "MAX_GENERATED")]
+    scope = {"Path": Path, "rwb_fairies": rf}
+    exec(compile(ast.Module(nodes, []), "rwb_world", "exec"), scope)
+    r = random.Random(2)
+    kept_marks = sum(scope["scribble_keep"](1.0, r.random()) for _ in range(500))
+    kept_plain = sum(scope["scribble_keep"](0.0, r.random()) for _ in range(500))
+    check("notes: grass follows the scribbles", kept_marks == 500 and 60 < kept_plain < 140, (kept_marks, kept_plain))
+    check("notes: grass outside the picture isn't thinned", scope["scribble_keep"](None, 0.99))
+    check("notes: more grass and more trees", scope["GRASS_MORE"] > 1.0 and scope["BASE_COUNTS"]["tree"] >= 30)
+    check("notes: look-alikes stand taller", scope["LOOKALIKE_TALL"] >= 1.3)
+    check("notes: the build passes the scribble map to the grass", 'inv.get("scribbles")' in source)
+    # --- fairies: lights with wings, not models
+    plan = [{"inst": {"cutout": __file__}, "category": "fairy"}, {"inst": {"cutout": __file__}, "category": "mushroom"}]
+    jobs = scope["_job_objects"](plan, None, 1.0, ())
+    check("notes: fairies get no 3D model", [j["category"] for j in jobs] == ["mushroom"])
+    pixels = rf.wing_pixels(32)
+    alpha = np.frombuffer(pixels, np.uint8).reshape(32, 32, 4)[..., 3]
+    check("notes: the wings are see-through round the edges", alpha[0, 0] == 0 and alpha[16, 16] > 200 and alpha.mean() > 30)
+    surf = pygame.image.load(rf.write_png(folder / "wings.png", 32, 32, pixels))
+    check("notes: the wing texture is a real PNG", surf.get_size() == (32, 32))
+    pink = rf.glow_colour({"dominant": "#6A5A70", "accent": "#E070D0", "top": "#DDDDDD"})
+    check("notes: a fairy shines in its most colourful paint",
+          pink[0] > pink[1] and pink[2] > pink[1] and max(pink) > 0.9, pink)
+    path = rf.float_path(random.Random(1))
+    check("notes: a fairy's float is a closed loop", path[0] == path[-1] == (0.0, 0.0, 0.0) and len(path) >= 4)
+    reach = max(math.hypot(p[0], p[1]) for p in path)
+    check("notes: a fairy stays near its spot", rf.FLOAT_REACH[0] * 0.5 <= reach <= rf.FLOAT_REACH[1] * 1.01, reach)
+    check("notes: extra fairies use the painted colours", rf.colours_for_extras([pink], 3) == [pink] * 3)
+    check("notes: with no painted colours, default ones", len(set(rf.colours_for_extras([], 4))) == 4)
+    pic = np.full((200, 200, 3), 70, np.uint8)
+    yy, xx = np.mgrid[0:200, 0:200]
+    pic[np.hypot(yy - 60, xx - 60) < 12] = (230, 160, 230)     # a coloured light where the first one is
+    items = [{"category": "floating", "label": "butterfly", "box": [50, 50, 70, 70]},
+             {"category": "floating", "label": "butterfly", "box": [140, 140, 160, 160]},
+             {"category": "mushroom", "label": "mushroom", "box": [50, 50, 70, 70]}]
+    changes = ro.fairy_check(pic, items)
+    check("notes: a glowing butterfly is a fairy",
+          items[0]["category"] == "fairy" and changes == ["butterfly -> fairy"], changes)
+    check("notes: a plain butterfly stays one", items[1]["category"] == "floating")
+    check("notes: fairies may fly", "fairy" in ro.AIRBORNE_CATEGORIES)
+    check("notes: the detector's phrases are unchanged (new ones shifted what it found)",
+          "fairy" not in ro.QUERIES.values())
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true", help="run the real vision models and Blender")
@@ -1771,7 +1981,8 @@ def main():
     for test in (test_camera, test_placement, test_ground_placement, test_filtering, test_masks, test_labels,
                  test_psd_names, test_mesh, test_ground_shape, test_end_to_end_no_blender,
                  test_clicks_are_queued, test_catalog, test_settings, test_buildings_and_signs, test_water_check, test_floor_finding, test_trees_and_style, test_tree_reading, test_surfaces, test_wading, test_progress_and_speed, test_shape_choice, test_outlines, test_water,
-                 test_read_strokes, test_quilt, test_bake, test_sketch, test_depth_and_buildings):
+                 test_read_strokes, test_quilt, test_bake, test_sketch, test_depth_and_buildings, test_speedups,
+                 test_round_two_notes):
         test()
     if args.live:
         test_live(Path(args.image) if args.image else default_image())

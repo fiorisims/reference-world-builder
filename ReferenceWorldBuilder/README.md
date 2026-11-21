@@ -78,9 +78,19 @@ colour; sky, mist and stone are neither.
   wide, so it looks right from the side and not like a painted card.
 - **Look-alike trees.** The trunks across the whole picture give the tree style: how thick they are,
   where they fork, how far the branches spread, where the leaves start, how wide the canopy is, and
-  the bark and leaf colours. Four new trees are drawn and painted in that style, then modelled like the
-  painted ones. They are only used for extra copies outside the painted view. The report says what was
-  read, e.g. *Tree style: 15 trunks read, fork at 57%, 2 branches, leaves from 38% of the height up*.
+  the bark and leaf colours. Six new trees are drawn in that style and painted with **the painting's own
+  brushwork**: seamless bark and leaf textures are stitched from patches of the painted trunks and canopies
+  (at full resolution) and laid over the light and shade. They're modelled like the painted ones, used only
+  for extra copies outside the painted view, and stand about 1.5x the usual tree height. A forest gets
+  about twice as many extra trees as before. The report says what was read, e.g. *Tree style: 15 trunks
+  read, fork at 57%, 2 branches, leaves from 38% of the height up*.
+
+### Fairies
+
+A glowing butterfly, crystal or bird in the air (a soft halo around it) or anything the detector calls a
+fairy, glowing orb or wisp, becomes a **fairy**: not a model, but a small glowing core with soft wings and a
+coloured point light, in the colour it was painted. When you press Play it drifts along a slow loop near
+where it was painted, and about eight more fairies in the painted colours float around the rest of the world.
 
 ### Cities, rooms, deserts, snow and coasts
 
@@ -169,13 +179,18 @@ result, such as `Ground: grass 84%, meadow 16%`.
 - **What each surface is** is judged by CLIP seeing it in its surroundings (a lit sidewalk next to a kerb reads
   as a sidewalk), plus a little by its colour. In streets and rooms only the floor counts as ground, so
   shop fronts and walls below the horizon don't.
-- **Grass** grows on grassy ground (turn off **Grow grass on grassy ground** to skip it).
+- **Grass** grows on grassy ground (turn off **Grow grass on grassy ground** to skip it). Where the painted
+  ground is covered in small scribbles and flecks, the grass gathers there in smaller tufts, so it follows
+  the marks it was drawn with; elsewhere it is spread more thinly.
 - **Water is only made when it is really water.** Every candidate (a pond the detector found, a bluish part of
   the ground) is checked by CLIP looking at it with its surroundings and at the whole picture: a lake in a
   forest reads 81% water, blue-lit pavement or a neon-lit road 10-20%, so those stay dry. Grey paint (a
   sketch) is never water, and streets and rooms need more proof. The panel says what it decided, e.g.
   `Water: none (a bluish part of the ground looked wet, but reads as dry ground in its surroundings)`.
   Untick **Water where the picture has water** to never make any.
+- **One lake stays one lake.** A canoe or lily pad painted over the water hides water, not land, so the
+  water continues under it and pieces it separates are joined (islands stay islands). The report says so,
+  e.g. `3 pieces joined into 1 under the boats and lily pads`.
 - **Water** is never a floor, in any build mode. If the picture has water, you walk into it, down to the
   basin below, and wade at about half speed at depth.
   Swimming isn't built: you walk on the lake bed.
@@ -270,7 +285,9 @@ Blender does no recognition: seeing the objects is the vision models' job.
 
 The first analysis downloads about 350 MB of models once (OWLv2 155 MB, SlimSAM 40 MB, CLIP 153 MB;
 offline, put the files in `../models/owlv2`, `slimsam`, `clip`). Then, on a CPU with no NVIDIA GPU:
-a first analyze + generate takes about 3-4 minutes. Results are
+a first analyze + generate takes about 3-4 minutes. The small vision models run on 4 threads (on laptops
+with power-saving cores, more threads made them 2-3x slower; set `RWB_THREADS` to override), each model
+is loaded once per analysis, and cached models are found without asking Hugging Face. Results are
 cached, so generating again takes about 1 minute, and a drawn shape takes a few seconds. **Unreal's window does not respond during these
 steps; it hasn't crashed.**
 

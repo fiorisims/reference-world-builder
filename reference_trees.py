@@ -27,6 +27,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import reference_png  # noqa: E402
 
 TREES = {"tree", "pine"}
 ARCHITECTURE = {"castle", "house", "tower"}    # what a treehouse gets mistaken for
@@ -49,7 +50,9 @@ WEAK_BUILDING = 0.3            # detector scores below this are "maybe a buildin
 TRUNK_ONLY = 0.7               # a weak building this much bark column is just a trunk
 TRUNK_MIN_HEIGHT = 0.12        # of the picture's height, for a bark shape to count as a trunk
 TRUNK_MIN_ASPECT = 3.0         # height / width
-LOOKALIKES = 4                 # new tree designs per picture
+LOOKALIKES = 6                 # new tree designs per picture
+TEXTURE_TILE = 256             # px: seamless bark / leaf tiles quilted from the painting
+TEXTURE_PATCH = 40             # px: the painted patches they are made of
 LOOKALIKE_HEIGHT = 512         # pixels, of each look-alike's cut-out
 STYLE_VERSION = "rwb-trees-1"
 
@@ -121,22 +124,8 @@ def grow_within(seed, allowed, limit=2000):
 
 def components(mask):
     """Connected regions of a bool map, as a label map (0 = none) and the number of regions."""
-    h, w = mask.shape
-    labels = np.zeros((h, w), np.int32)
-    count = 0
-    for start in zip(*np.nonzero(mask)):
-        if labels[start]:
-            continue
-        count += 1
-        stack = [start]
-        labels[start] = count
-        while stack:
-            y, x = stack.pop()
-            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
-                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not labels[ny, nx]:
-                    labels[ny, nx] = count
-                    stack.append((ny, nx))
-    return labels, count
+    import reference_scene
+    return reference_scene.label(mask)
 
 
 # --------------------------------------------------------------------------- #
@@ -523,6 +512,60 @@ def read_style(rgb, tree_masks=(), canopy_masks=(), exclude=None, horizon=None):
     return style, bark_px, leaf_px
 
 
+def texture_tiles(rgb, canopy_masks=(), exclude=None, horizon=None, seed=3):
+    """(bark tile, leaf tile): seamless squares quilted from the picture's own bark and leaf paint, so
+    look-alikes wear the painter's brushwork rather than flat colour.  Either is None if too little paint fits."""
+    import reference_strokes
+    foliage, bark = colour_classes(rgb)
+    if exclude is not None:
+        bark = bark & ~exclude
+    leaf_area = np.zeros(foliage.shape, bool)
+    for canopy in canopy_masks:
+        if canopy is not None:
+            leaf_area |= canopy
+    leaf_area &= foliage
+    if leaf_area.sum() < TEXTURE_PATCH * TEXTURE_PATCH * 4:
+        leaf_area = foliage.copy()
+        if horizon is not None:
+            leaf_area[int(horizon):] = False            # below the horizon it is grass
+    source = np.asarray(rgb, np.float32)
+    tiles = []
+    for n, area in enumerate((bark, leaf_area)):
+        try:
+            tile = reference_strokes.quilt(source, TEXTURE_TILE, TEXTURE_PATCH, area, seed + n)
+        except Exception:
+            tile = None
+        tiles.append(None if tile is None else np.clip(tile[:TEXTURE_TILE, :TEXTURE_TILE, :3], 0, 255))
+    return tiles[0], tiles[1]
+
+
+def _tiled(tile, h, w, rng):
+    """A tile repeated over h x w from a random offset (the tiles are seamless)."""
+    th, tw = tile.shape[:2]
+    big = np.tile(tile, (h // th + 2, w // tw + 2, 1))
+    oy, ox = int(rng.integers(0, th)), int(rng.integers(0, tw))
+    return big[oy:oy + h, ox:ox + w]
+
+
+BRUSH_DETAIL = 2.2             # how strongly the painting's brush marks show on look-alikes
+BRUSH_CLIP = 18.0              # most a brush mark may differ from the paint around it (0-255)
+
+
+def _brushwork(tile):
+    """A tile's brush marks without its broad tone (tile minus its blur), so no patch shows as a block."""
+    tile = np.asarray(tile, np.float64)
+    h, w = tile.shape[:2]
+    around = np.tile(tile, (3, 3, 1))                  # the tile repeats: blur it wrapped, or its edges show
+    broad = np.stack([_blur(around[..., c], 14) for c in range(3)], -1)[h:2 * h, w:2 * w]
+    return np.clip(tile - broad, -BRUSH_CLIP, BRUSH_CLIP)   # a stray bright fleck stays a fleck
+
+
+def _textured(base, detail_tile, rng):
+    """Lit colour (HxWx3) with the painting's brush marks laid over it."""
+    h, w = base.shape[:2]
+    return base + BRUSH_DETAIL * _tiled(detail_tile, h, w, rng)
+
+
 def line(style):
     """One report line about the style."""
     fork = "fork at %d%%" % round(style["fork"] * 100) if style.get("fork") else "single trunk"
@@ -679,8 +722,12 @@ def _palette(pixels, fallback, n=9):
     return [tuple(c.mean(0)) for c in chunks if len(c)]
 
 
-def paint_tree(style, bark_px, leaf_px, seed, height=LOOKALIKE_HEIGHT):
-    """A painted RGBA cut-out of a new tree in the picture's style."""
+def paint_tree(style, bark_px, leaf_px, seed, height=LOOKALIKE_HEIGHT, tiles=(None, None)):
+    """A painted RGBA cut-out of a new tree in the picture's style.
+
+    tiles: (bark, leaf) textures from texture_tiles: when given, the tree is painted with the picture's
+    own brushwork, lit like the drawing; otherwise with colour ramps of its bark and leaf paint.
+    """
     rng = np.random.default_rng(seed + 1000)
     wood, cross, canopy, shade = draw_tree(style, seed, height)
     h, w = wood.shape
@@ -691,19 +738,24 @@ def paint_tree(style, bark_px, leaf_px, seed, height=LOOKALIKE_HEIGHT):
     streaks = 0.6 * _noise(h, w, 10, rng, (1.0, 6.0)) + 0.4 * _noise(h, w, 40, rng, (1.0, 6.0))
     lit = 0.5 - 0.35 * cross
     t = np.clip(0.55 * lit + 0.45 * streaks, 0.0, 1.0)
+    bark_tile, leaf_tile = tiles if tiles else (None, None)
     colour = _ramp(bark, t)
+    if bark_tile is not None:
+        colour = _textured(colour, _brushwork(bark_tile), rng)
     out[wood, :3] = np.clip(colour[wood], 0, 255).astype(np.uint8)
     # leaves: blotches, lighter on each clump's lit side and toward the top
     blotch = 0.6 * _noise(h, w, 8, rng) + 0.4 * _noise(h, w, 30, rng)
     top_light = 1.0 - np.linspace(0.0, 1.0, h)[:, None] * 0.6
     t = np.clip(0.4 * shade + 0.4 * blotch + 0.2 * top_light, 0.0, 1.0)
     colour = _ramp(leaves, t)
+    if leaf_tile is not None:
+        colour = _textured(colour, _brushwork(leaf_tile), rng)
     out[canopy, :3] = np.clip(colour[canopy], 0, 255).astype(np.uint8)
     out[..., 3] = np.where(wood | canopy, 255, 0).astype(np.uint8)
     return out
 
 
-def lookalikes(style, bark_px, leaf_px, out_dir, count=LOOKALIKES, seed=1):
+def lookalikes(style, bark_px, leaf_px, out_dir, count=LOOKALIKES, seed=1, tiles=(None, None)):
     """Write ``count`` painted look-alike cut-outs.  Returns [{cutout, category, label, ...}]."""
     import pygame
     out_dir = Path(out_dir)
@@ -712,15 +764,15 @@ def lookalikes(style, bark_px, leaf_px, out_dir, count=LOOKALIKES, seed=1):
         old.unlink()
     made = []
     for n in range(count):
-        rgba = paint_tree(style, bark_px, leaf_px, seed * 97 + n)
+        rgba = paint_tree(style, bark_px, leaf_px, seed * 97 + n, tiles=tiles)
         h, w = rgba.shape[:2]
         path = out_dir / ("lookalike_tree_%02d.png" % n)
-        pygame.image.save(pygame.image.frombuffer(np.ascontiguousarray(rgba).tobytes(), (w, h), "RGBA"), str(path))
+        reference_png.save(pygame.image.frombuffer(np.ascontiguousarray(rgba).tobytes(), (w, h), "RGBA"), str(path))
         leaves = out_dir / ("lookalike_tree_%02d_leaves.png" % n)
         _wood, _cross, canopy, _shade = draw_tree(style, seed * 97 + n)
         mask = np.zeros((h, w, 4), np.uint8)
         mask[..., 3] = np.where(canopy, 255, 0)
-        pygame.image.save(pygame.image.frombuffer(mask.tobytes(), (w, h), "RGBA"), str(leaves))
+        reference_png.save(pygame.image.frombuffer(mask.tobytes(), (w, h), "RGBA"), str(leaves))
         made.append({"id": "la_tree_%02d" % n, "cutout": str(path), "leaves": str(leaves), "category": "tree",
                      "label": "tree like the painted ones", "quality": 1.0, "roughness": 0.0,
                      "area": 0.05, "lookalike": "tree", "aspect": h / float(w)})

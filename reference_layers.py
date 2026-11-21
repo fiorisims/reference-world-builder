@@ -67,6 +67,8 @@ DEFAULT_KEYWORDS = {
             "cliff", "crag", "ledge", "bluff", "outcrop", "rockface", "plateau", "mesa"]},
         "log": {"kind": "object", "words": [
             "log", "stump", "trunk", "branch", "driftwood", "timber", "fallen tree", "tree trunk"]},
+        "fairy": {"kind": "object", "words": [
+            "fairy", "fairies", "fairy light", "wisp", "will-o-the-wisp", "sprite", "pixie"]},
         "treehouse": {"kind": "object", "words": [
             "treehouse", "tree house", "tree home", "tree hut", "tree cottage"]},
         "castle": {"kind": "object", "words": [
@@ -93,7 +95,7 @@ DEFAULT_KEYWORDS = {
             "well", "fountain", "altar", "desk", "shelf", "cabinet"]},
         "character": {"kind": "card", "words": [
             "character", "person", "people", "princess", "prince", "king", "queen", "girl", "boy", "man",
-            "woman", "child", "kid", "baby", "fairy", "witch", "sorceress", "villain", "hero", "knight",
+            "woman", "child", "kid", "baby", "witch", "sorceress", "villain", "hero", "knight",
             "guard", "soldier", "figure", "crowd", "aurora", "phillip", "philip", "maleficent", "merryweather",
             "flora", "fauna", "lady", "maiden", "human", "servant", "goon"]},
         "creature": {"kind": "card", "words": [
